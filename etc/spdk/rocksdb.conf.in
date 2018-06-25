@@ -12,23 +12,11 @@
 #  Ex. [TargetNode1] = TargetNode section key with tag number 1
 [Global]
   # Users can restrict work items to only run on certain cores by
-  #  specifying a WorkerMask.  Default is to allow work items to run
+  #  specifying a ReactorMask.  Default is to allow work items to run
   #  on all cores.
-  #WorkerMask 0xFFFF
-
-  # Event mask for ids history buffers
-  # Default: 0x0 (all events disabled)
-  # Set to 0xFFFFFFFFFFFFFFFF to enable all events.
-  #EventMask 0x0
-
-[Rpc]
-  # Defines whether spdk will enable configuration via RPC.
-  # Default is disabled.  Note that the RPC interface is not
-  # authenticated, so users should be careful about enabling
-  # RPC in non-trusted environments.
-  #Enable No
+  #ReactorMask 0x1
 
 [Ioat]
-  Disable Yes
+  Enable No
 
 # [Nvme] section will get appended here by scripts/gen_nvme.sh.

@@ -1,15 +1,19 @@
 #include "iscsi/task.h"
 #include "iscsi/iscsi.h"
 #include "iscsi/conn.h"
+#include "iscsi/acceptor.h"
 
 #include "spdk/env.h"
 #include "spdk/event.h"
+#include "spdk/sock.h"
 
 #include "spdk_internal/log.h"
 
 #include "scsi/scsi_internal.h"
 
-SPDK_LOG_REGISTER_TRACE_FLAG("iscsi", SPDK_TRACE_ISCSI)
+SPDK_LOG_REGISTER_COMPONENT("iscsi", SPDK_LOG_ISCSI)
+
+TAILQ_HEAD(, spdk_iscsi_pdu) g_write_pdu_list;
 
 struct spdk_iscsi_task *
 spdk_iscsi_task_get(struct spdk_iscsi_conn *conn,
@@ -32,8 +36,9 @@ spdk_scsi_task_put(struct spdk_scsi_task *task)
 void
 spdk_put_pdu(struct spdk_iscsi_pdu *pdu)
 {
-	if (!pdu)
+	if (!pdu) {
 		return;
+	}
 
 	pdu->ref--;
 	if (pdu->ref < 0) {
@@ -59,7 +64,7 @@ spdk_get_pdu(void)
 		return NULL;
 	}
 
-	memset(pdu, 0, offsetof(struct spdk_iscsi_pdu, ahs_data));
+	memset(pdu, 0, offsetof(struct spdk_iscsi_pdu, ahs));
 	pdu->ref = 1;
 
 	return pdu;
@@ -89,6 +94,73 @@ spdk_scsi_dev_queue_mgmt_task(struct spdk_scsi_dev *dev,
 {
 }
 
+const char *
+spdk_scsi_dev_get_name(const struct spdk_scsi_dev *dev)
+{
+	if (dev != NULL) {
+		return dev->name;
+	}
+
+	return NULL;
+}
+
+void
+spdk_iscsi_acceptor_start(struct spdk_iscsi_portal *p)
+{
+}
+
+void
+spdk_iscsi_acceptor_stop(struct spdk_iscsi_portal *p)
+{
+}
+
+struct spdk_sock *
+spdk_sock_listen(const char *ip, int port)
+{
+	static int g_sock;
+
+	return (struct spdk_sock *)&g_sock;
+}
+
+int
+spdk_sock_close(struct spdk_sock **sock)
+{
+	*sock = NULL;
+
+	return 0;
+}
+
+static struct spdk_cpuset *g_app_core_mask;
+
+struct spdk_cpuset *
+spdk_app_get_core_mask(void)
+{
+	int i;
+	if (!g_app_core_mask) {
+		g_app_core_mask = spdk_cpuset_alloc();
+		for (i = 0; i < SPDK_CPUSET_SIZE; i++) {
+			spdk_cpuset_set_cpu(g_app_core_mask, i, true);
+		}
+	}
+	return g_app_core_mask;
+}
+
+int
+spdk_app_parse_core_mask(const char *mask, struct spdk_cpuset *cpumask)
+{
+	int rc;
+
+	if (mask == NULL || cpumask == NULL) {
+		return -1;
+	}
+
+	rc = spdk_cpuset_parse(cpumask, mask);
+	if (rc < 0) {
+		return -1;
+	}
+	return 0;
+}
+
 uint32_t
 spdk_env_get_current_core(void)
 {
@@ -102,7 +174,7 @@ spdk_event_allocate(uint32_t core, spdk_event_fn fn, void *arg1, void *arg2)
 }
 
 struct spdk_scsi_dev *
-	spdk_scsi_dev_construct(const char *name, char **lun_name_list,
+	spdk_scsi_dev_construct(const char *name, const char **bdev_name_list,
 			int *lun_id_list, int num_luns, uint8_t protocol_id,
 			void (*hotremove_cb)(const struct spdk_scsi_lun *, void *),
 			void *hotremove_ctx)
@@ -124,6 +196,12 @@ spdk_scsi_dev_add_port(struct spdk_scsi_dev *dev, uint64_t id, const char *name)
 int
 spdk_iscsi_drop_conns(struct spdk_iscsi_conn *conn, const char *conn_match,
 		      int drop_all)
+{
+	return 0;
+}
+
+int
+spdk_scsi_dev_delete_port(struct spdk_scsi_dev *dev, uint64_t id)
 {
 	return 0;
 }
@@ -153,12 +231,13 @@ spdk_iscsi_conn_read_data(struct spdk_iscsi_conn *conn, int bytes,
 }
 
 void
-spdk_iscsi_conn_logout(struct spdk_iscsi_conn *conn)
+spdk_iscsi_conn_write_pdu(struct spdk_iscsi_conn *conn, struct spdk_iscsi_pdu *pdu)
 {
+	TAILQ_INSERT_TAIL(&g_write_pdu_list, pdu, tailq);
 }
 
 void
-spdk_scsi_dev_print(struct spdk_scsi_dev *dev)
+spdk_iscsi_conn_logout(struct spdk_iscsi_conn *conn)
 {
 }
 

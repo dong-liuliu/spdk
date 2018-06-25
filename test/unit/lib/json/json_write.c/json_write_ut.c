@@ -35,7 +35,8 @@
 
 #include "spdk_cunit.h"
 
-#include "json_write.c"
+#include "json/json_write.c"
+#include "json/json_parse.c"
 
 #include "spdk/util.h"
 
@@ -86,6 +87,18 @@ write_cb(void *cb_ctx, const void *data, size_t size)
 #define STR_FAIL(in) \
 	BEGIN(); VAL_STRING_FAIL(in); END_FAIL()
 
+#define VAL_STRING_UTF16LE(str) \
+	CU_ASSERT(spdk_json_write_string_utf16le_raw(w, (const uint16_t *)str, sizeof(str) / sizeof(uint16_t) - 1) == 0)
+
+#define VAL_STRING_UTF16LE_FAIL(str) \
+	CU_ASSERT(spdk_json_write_string_utf16le_raw(w, (const uint16_t *)str, sizeof(str) / sizeof(uint16_t) - 1) < 0)
+
+#define STR_UTF16LE_PASS(in, out) \
+	BEGIN(); VAL_STRING_UTF16LE(in); END("\"" out "\"")
+
+#define STR_UTF16LE_FAIL(in) \
+	BEGIN(); VAL_STRING_UTF16LE_FAIL(in); END_FAIL()
+
 #define VAL_NAME(name) \
 	CU_ASSERT(spdk_json_write_name_raw(w, name, sizeof(name) - 1) == 0)
 
@@ -95,6 +108,9 @@ write_cb(void *cb_ctx, const void *data, size_t size)
 
 #define VAL_INT32(i) CU_ASSERT(spdk_json_write_int32(w, i) == 0);
 #define VAL_UINT32(u) CU_ASSERT(spdk_json_write_uint32(w, u) == 0);
+
+#define VAL_INT64(i) CU_ASSERT(spdk_json_write_int64(w, i) == 0);
+#define VAL_UINT64(u) CU_ASSERT(spdk_json_write_uint64(w, u) == 0);
 
 #define VAL_ARRAY_BEGIN() CU_ASSERT(spdk_json_write_array_begin(w) == 0)
 #define VAL_ARRAY_END() CU_ASSERT(spdk_json_write_array_end(w) == 0)
@@ -249,6 +265,37 @@ test_write_string_escapes(void)
 }
 
 static void
+test_write_string_utf16le(void)
+{
+	struct spdk_json_write_ctx *w;
+
+	/* All characters in BMP */
+	STR_UTF16LE_PASS(((uint8_t[]) {
+		'H', 0, 'e', 0, 'l', 0, 'l', 0, 'o', 0, 0x15, 0xFE, 0, 0
+	}), "Hello\\uFE15");
+
+	/* Surrogate pair */
+	STR_UTF16LE_PASS(((uint8_t[]) {
+		'H', 0, 'i', 0,  0x34, 0xD8, 0x1E, 0xDD, '!', 0, 0, 0
+	}), "Hi\\uD834\\uDD1E!");
+
+	/* Valid high surrogate, but no low surrogate */
+	STR_UTF16LE_FAIL(((uint8_t[]) {
+		0x00, 0xD8, 0, 0 /* U+D800 */
+	}));
+
+	/* Invalid leading low surrogate */
+	STR_UTF16LE_FAIL(((uint8_t[]) {
+		0x00, 0xDC, 0x00, 0xDC, 0, 0 /* U+DC00 U+DC00 */
+	}));
+
+	/* Valid high surrogate followed by another high surrogate (invalid) */
+	STR_UTF16LE_FAIL(((uint8_t[]) {
+		0x00, 0xD8, 0x00, 0xD8, 0, 0 /* U+D800 U+D800 */
+	}));
+}
+
+static void
 test_write_number_int32(void)
 {
 	struct spdk_json_write_ctx *w;
@@ -302,6 +349,62 @@ test_write_number_uint32(void)
 	BEGIN();
 	VAL_UINT32(4294967295);
 	END("4294967295");
+}
+
+static void
+test_write_number_int64(void)
+{
+	struct spdk_json_write_ctx *w;
+
+	BEGIN();
+	VAL_INT64(0);
+	END("0");
+
+	BEGIN();
+	VAL_INT64(1);
+	END("1");
+
+	BEGIN();
+	VAL_INT64(123);
+	END("123");
+
+	BEGIN();
+	VAL_INT64(-123);
+	END("-123");
+
+	BEGIN();
+	VAL_INT64(INT64_MAX);
+	END("9223372036854775807");
+
+	BEGIN();
+	VAL_INT64(INT64_MIN);
+	END("-9223372036854775808");
+}
+
+static void
+test_write_number_uint64(void)
+{
+	struct spdk_json_write_ctx *w;
+
+	BEGIN();
+	VAL_UINT64(0);
+	END("0");
+
+	BEGIN();
+	VAL_UINT64(1);
+	END("1");
+
+	BEGIN();
+	VAL_UINT64(123);
+	END("123");
+
+	BEGIN();
+	VAL_UINT64(INT64_MAX);
+	END("9223372036854775807");
+
+	BEGIN();
+	VAL_UINT64(UINT64_MAX);
+	END("18446744073709551615");
 }
 
 static void
@@ -618,8 +721,11 @@ int main(int argc, char **argv)
 		CU_add_test(suite, "write_literal", test_write_literal) == NULL ||
 		CU_add_test(suite, "write_string_simple", test_write_string_simple) == NULL ||
 		CU_add_test(suite, "write_string_escapes", test_write_string_escapes) == NULL ||
+		CU_add_test(suite, "write_string_utf16le", test_write_string_utf16le) == NULL ||
 		CU_add_test(suite, "write_number_int32", test_write_number_int32) == NULL ||
 		CU_add_test(suite, "write_number_uint32", test_write_number_uint32) == NULL ||
+		CU_add_test(suite, "write_number_int64", test_write_number_int64) == NULL ||
+		CU_add_test(suite, "write_number_uint64", test_write_number_uint64) == NULL ||
 		CU_add_test(suite, "write_array", test_write_array) == NULL ||
 		CU_add_test(suite, "write_object", test_write_object) == NULL ||
 		CU_add_test(suite, "write_nesting", test_write_nesting) == NULL ||

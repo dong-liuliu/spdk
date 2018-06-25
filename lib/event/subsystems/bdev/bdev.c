@@ -34,8 +34,11 @@
 #include "spdk/stdinc.h"
 
 #include "spdk/bdev.h"
+#include "spdk/env.h"
+#include "spdk/thread.h"
 
 #include "spdk_internal/event.h"
+#include "spdk/env.h"
 
 static void
 spdk_bdev_initialize_complete(void *cb_arg, int rc)
@@ -44,39 +47,37 @@ spdk_bdev_initialize_complete(void *cb_arg, int rc)
 }
 
 static void
-spdk_bdev_subsystem_start_poller(struct spdk_bdev_poller **ppoller,
-				 spdk_bdev_poller_fn fn,
-				 void *arg,
-				 uint32_t lcore,
-				 uint64_t period_microseconds)
-{
-	spdk_poller_register((struct spdk_poller **)ppoller,
-			     fn,
-			     arg,
-			     lcore,
-			     period_microseconds);
-}
-
-static void
-spdk_bdev_subsystem_stop_poller(struct spdk_bdev_poller **ppoller)
-{
-	spdk_poller_unregister((struct spdk_poller **)ppoller, NULL);
-}
-
-static void
 spdk_bdev_subsystem_initialize(void)
 {
-	spdk_bdev_initialize(spdk_bdev_initialize_complete, NULL,
-			     spdk_bdev_subsystem_start_poller,
-			     spdk_bdev_subsystem_stop_poller);
+	spdk_bdev_initialize(spdk_bdev_initialize_complete, NULL);
 }
 
-static int
+static void
+spdk_bdev_subsystem_finish_done(void *cb_arg)
+{
+	spdk_subsystem_fini_next();
+}
+
+static void
 spdk_bdev_subsystem_finish(void)
 {
-	return spdk_bdev_finish();
+	spdk_bdev_finish(spdk_bdev_subsystem_finish_done, NULL);
 }
 
-SPDK_SUBSYSTEM_REGISTER(bdev, spdk_bdev_subsystem_initialize,
-			spdk_bdev_subsystem_finish, spdk_bdev_config_text)
+static void
+_spdk_bdev_subsystem_config_json(struct spdk_json_write_ctx *w, struct spdk_event *done_ev)
+{
+	spdk_bdev_subsystem_config_json(w);
+	spdk_event_call(done_ev);
+}
+
+static struct spdk_subsystem g_spdk_subsystem_bdev = {
+	.name = "bdev",
+	.init = spdk_bdev_subsystem_initialize,
+	.fini = spdk_bdev_subsystem_finish,
+	.config = spdk_bdev_config_text,
+	.write_config_json = _spdk_bdev_subsystem_config_json,
+};
+
+SPDK_SUBSYSTEM_REGISTER(g_spdk_subsystem_bdev);
 SPDK_SUBSYSTEM_DEPEND(bdev, copy)

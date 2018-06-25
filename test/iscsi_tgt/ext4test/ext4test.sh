@@ -2,7 +2,7 @@
 
 testdir=$(readlink -f $(dirname $0))
 rootdir=$(readlink -f $testdir/../../..)
-source $rootdir/scripts/autotest_common.sh
+source $rootdir/test/common/autotest_common.sh
 source $rootdir/test/iscsi_tgt/common.sh
 
 if [ ! -z $1 ]; then
@@ -14,12 +14,6 @@ timing_enter ext4test
 cp $testdir/iscsi.conf.in $testdir/iscsi.conf
 $rootdir/scripts/gen_nvme.sh >> $testdir/iscsi.conf
 
-# iSCSI target configuration
-PORT=3260
-RPC_PORT=5260
-INITIATOR_TAG=2
-INITIATOR_NAME=ALL
-NETMASK=$INITIATOR_IP/32
 
 rpc_py="python $rootdir/scripts/rpc.py"
 
@@ -31,22 +25,22 @@ echo "Process pid: $pid"
 
 trap "killprocess $pid; exit 1" SIGINT SIGTERM EXIT
 
-waitforlisten $pid ${RPC_PORT}
+waitforlisten $pid
 echo "iscsi_tgt is listening. Running tests..."
 
 timing_exit start_iscsi_tgt
 
-$rpc_py add_portal_group 1 $TARGET_IP:$PORT
+$rpc_py add_portal_group $PORTAL_TAG $TARGET_IP:$ISCSI_PORT
 $rpc_py add_initiator_group $INITIATOR_TAG $INITIATOR_NAME $NETMASK
 $rpc_py construct_error_bdev 'Malloc0'
 # "1:2" ==> map PortalGroup1 to InitiatorGroup2
 # "64" ==> iSCSI queue depth 64
-# "1 0 0 0" ==> disable CHAP authentication
-$rpc_py construct_target_node Target0 Target0_alias EE_Malloc0:0 1:2 64 1 0 0 0
+# "-d" ==> disable CHAP authentication
+$rpc_py construct_target_node Target0 Target0_alias EE_Malloc0:0 1:2 64 -d
 sleep 1
 
-iscsiadm -m discovery -t sendtargets -p $TARGET_IP:$PORT
-iscsiadm -m node --login -p $TARGET_IP:$PORT
+iscsiadm -m discovery -t sendtargets -p $TARGET_IP:$ISCSI_PORT
+iscsiadm -m node --login -p $TARGET_IP:$ISCSI_PORT
 
 trap 'for new_dir in `dir -d /mnt/*dir`; do umount $new_dir; rm -rf $new_dir; done; \
 	iscsicleanup; killprocess $pid; exit 1' SIGINT SIGTERM EXIT
@@ -77,11 +71,11 @@ echo "Error injection test done"
 iscsicleanup
 
 if [ -z "$NO_NVME" ]; then
-$rpc_py construct_target_node Target1 Target1_alias Nvme0n1:0 1:2 64 1 0 0 0
+$rpc_py construct_target_node Target1 Target1_alias Nvme0n1:0 1:2 64 -d
 fi
 
-iscsiadm -m discovery -t sendtargets -p $TARGET_IP:$PORT
-iscsiadm -m node --login -p $TARGET_IP:$PORT
+iscsiadm -m discovery -t sendtargets -p $TARGET_IP:$ISCSI_PORT
+iscsiadm -m node --login -p $TARGET_IP:$ISCSI_PORT
 
 devs=$(iscsiadm -m session -P 3 | grep "Attached scsi disk" | awk '{print $4}')
 
@@ -119,9 +113,12 @@ for dev in $devs; do
 	echo ""
 done
 
+$rpc_py delete_error_bdev EE_Malloc0
+
 trap - SIGINT SIGTERM EXIT
 
 rm -f $testdir/iscsi.conf
 iscsicleanup
 killprocess $pid
+report_test_completion "nightly_iscsi_ext4test"
 timing_exit ext4test

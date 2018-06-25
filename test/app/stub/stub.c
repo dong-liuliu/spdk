@@ -55,6 +55,11 @@ static bool
 probe_cb(void *cb_ctx, const struct spdk_nvme_transport_id *trid,
 	 struct spdk_nvme_ctrlr_opts *opts)
 {
+	/*
+	 * Set the io_queue_size to UINT16_MAX to initialize
+	 * the controller with the possible largest queue size.
+	 */
+	opts->io_queue_size = UINT16_MAX;
 	return true;
 }
 
@@ -100,6 +105,7 @@ main(int argc, char **argv)
 	spdk_app_opts_init(&opts);
 
 	opts.name = "stub";
+	opts.rpc_addr = NULL;
 
 	while ((ch = getopt(argc, argv, "i:m:n:p:s:H")) != -1) {
 		switch (ch) {
@@ -134,7 +140,7 @@ main(int argc, char **argv)
 	opts.shutdown_cb = stub_shutdown;
 	opts.max_delay_us = 1000 * 1000;
 
-	spdk_app_start(&opts, stub_start, (void *)(intptr_t)opts.shm_id, NULL);
+	ch = spdk_app_start(&opts, stub_start, (void *)(intptr_t)opts.shm_id, NULL);
 
-	return 0;
+	return ch;
 }

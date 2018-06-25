@@ -35,22 +35,17 @@
 
 #include "spdk/blob_bdev.h"
 #include "spdk/blob.h"
-#include "spdk/bdev.h"
-#include "spdk/io_channel.h"
+#include "spdk/thread.h"
 #include "spdk/log.h"
 #include "spdk/endian.h"
+#include "spdk/bdev_module.h"
 
 struct blob_bdev {
 	struct spdk_bs_dev	bs_dev;
 	struct spdk_bdev	*bdev;
 	struct spdk_bdev_desc	*desc;
+	bool			claimed;
 };
-
-static inline struct spdk_bdev *
-__get_bdev(struct spdk_bs_dev *dev)
-{
-	return ((struct blob_bdev *)dev)->bdev;
-}
 
 static inline struct spdk_bdev_desc *
 __get_desc(struct spdk_bs_dev *dev)
@@ -77,12 +72,10 @@ static void
 bdev_blob_read(struct spdk_bs_dev *dev, struct spdk_io_channel *channel, void *payload,
 	       uint64_t lba, uint32_t lba_count, struct spdk_bs_dev_cb_args *cb_args)
 {
-	struct spdk_bdev *bdev = __get_bdev(dev);
 	int rc;
-	uint32_t block_size = spdk_bdev_get_block_size(bdev);
 
-	rc = spdk_bdev_read(bdev, channel, payload, lba * block_size,
-			    lba_count * block_size, bdev_blob_io_complete, cb_args);
+	rc = spdk_bdev_read_blocks(__get_desc(dev), channel, payload, lba,
+				   lba_count, bdev_blob_io_complete, cb_args);
 	if (rc) {
 		cb_args->cb_fn(cb_args->channel, cb_args->cb_arg, rc);
 	}
@@ -92,12 +85,52 @@ static void
 bdev_blob_write(struct spdk_bs_dev *dev, struct spdk_io_channel *channel, void *payload,
 		uint64_t lba, uint32_t lba_count, struct spdk_bs_dev_cb_args *cb_args)
 {
-	struct spdk_bdev *bdev = __get_bdev(dev);
 	int rc;
-	uint32_t block_size = spdk_bdev_get_block_size(bdev);
 
-	rc = spdk_bdev_write(bdev, channel, payload, lba * block_size,
-			     lba_count * block_size, bdev_blob_io_complete, cb_args);
+	rc = spdk_bdev_write_blocks(__get_desc(dev), channel, payload, lba,
+				    lba_count, bdev_blob_io_complete, cb_args);
+	if (rc) {
+		cb_args->cb_fn(cb_args->channel, cb_args->cb_arg, rc);
+	}
+}
+
+
+static void
+bdev_blob_readv(struct spdk_bs_dev *dev, struct spdk_io_channel *channel,
+		struct iovec *iov, int iovcnt,
+		uint64_t lba, uint32_t lba_count, struct spdk_bs_dev_cb_args *cb_args)
+{
+	int rc;
+
+	rc = spdk_bdev_readv_blocks(__get_desc(dev), channel, iov, iovcnt, lba,
+				    lba_count, bdev_blob_io_complete, cb_args);
+	if (rc) {
+		cb_args->cb_fn(cb_args->channel, cb_args->cb_arg, rc);
+	}
+}
+
+static void
+bdev_blob_writev(struct spdk_bs_dev *dev, struct spdk_io_channel *channel,
+		 struct iovec *iov, int iovcnt,
+		 uint64_t lba, uint32_t lba_count, struct spdk_bs_dev_cb_args *cb_args)
+{
+	int rc;
+
+	rc = spdk_bdev_writev_blocks(__get_desc(dev), channel, iov, iovcnt, lba,
+				     lba_count, bdev_blob_io_complete, cb_args);
+	if (rc) {
+		cb_args->cb_fn(cb_args->channel, cb_args->cb_arg, rc);
+	}
+}
+
+static void
+bdev_blob_write_zeroes(struct spdk_bs_dev *dev, struct spdk_io_channel *channel, uint64_t lba,
+		       uint32_t lba_count, struct spdk_bs_dev_cb_args *cb_args)
+{
+	int rc;
+
+	rc = spdk_bdev_write_zeroes_blocks(__get_desc(dev), channel, lba,
+					   lba_count, bdev_blob_io_complete, cb_args);
 	if (rc) {
 		cb_args->cb_fn(cb_args->channel, cb_args->cb_arg, rc);
 	}
@@ -107,21 +140,40 @@ static void
 bdev_blob_unmap(struct spdk_bs_dev *dev, struct spdk_io_channel *channel, uint64_t lba,
 		uint32_t lba_count, struct spdk_bs_dev_cb_args *cb_args)
 {
-	struct spdk_bdev *bdev = __get_bdev(dev);
-	struct spdk_scsi_unmap_bdesc *desc;
+	struct blob_bdev *blob_bdev = (struct blob_bdev *)dev;
 	int rc;
 
-	SPDK_STATIC_ASSERT(sizeof(cb_args->scratch) >= sizeof(*desc), "scratch too small");
-
-	desc = (struct spdk_scsi_unmap_bdesc *)cb_args->scratch;
-	to_be64(&desc->lba, lba);
-	to_be32(&desc->block_count, lba_count);
-	desc->reserved = 0;
-
-	rc = spdk_bdev_unmap(bdev, channel, desc, 1, bdev_blob_io_complete, cb_args);
-	if (rc) {
-		cb_args->cb_fn(cb_args->channel, cb_args->cb_arg, rc);
+	if (spdk_bdev_io_type_supported(blob_bdev->bdev, SPDK_BDEV_IO_TYPE_UNMAP)) {
+		rc = spdk_bdev_unmap_blocks(__get_desc(dev), channel, lba, lba_count,
+					    bdev_blob_io_complete, cb_args);
+		if (rc) {
+			cb_args->cb_fn(cb_args->channel, cb_args->cb_arg, rc);
+		}
+	} else {
+		/*
+		 * If the device doesn't support unmap, immediately complete
+		 * the request. Blobstore does not rely on unmap zeroing
+		 * data.
+		 */
+		cb_args->cb_fn(cb_args->channel, cb_args->cb_arg, 0);
 	}
+}
+
+int
+spdk_bs_bdev_claim(struct spdk_bs_dev *bs_dev, struct spdk_bdev_module *module)
+{
+	struct blob_bdev *blob_bdev = (struct blob_bdev *)bs_dev;
+	int rc;
+
+	rc = spdk_bdev_module_claim_bdev(blob_bdev->bdev, NULL, module);
+	if (rc != 0) {
+		SPDK_ERRLOG("could not claim bs dev\n");
+		return rc;
+	}
+
+	blob_bdev->claimed = true;
+
+	return rc;
 }
 
 static struct spdk_io_channel *
@@ -142,13 +194,18 @@ static void
 bdev_blob_destroy(struct spdk_bs_dev *bs_dev)
 {
 	struct spdk_bdev_desc *desc = __get_desc(bs_dev);
+	struct blob_bdev *blob_bdev = (struct blob_bdev *)bs_dev;
+
+	if (blob_bdev->claimed) {
+		spdk_bdev_module_release_bdev(blob_bdev->bdev);
+	}
 
 	spdk_bdev_close(desc);
 	free(bs_dev);
 }
 
 struct spdk_bs_dev *
-spdk_bdev_create_bs_dev(struct spdk_bdev *bdev)
+spdk_bdev_create_bs_dev(struct spdk_bdev *bdev, spdk_bdev_remove_cb_t remove_cb, void *remove_ctx)
 {
 	struct blob_bdev *b;
 	struct spdk_bdev_desc *desc;
@@ -161,9 +218,8 @@ spdk_bdev_create_bs_dev(struct spdk_bdev *bdev)
 		return NULL;
 	}
 
-	rc = spdk_bdev_open(bdev, true, NULL, NULL, &desc);
+	rc = spdk_bdev_open(bdev, true, remove_cb, remove_ctx, &desc);
 	if (rc != 0) {
-		SPDK_ERRLOG("could not open bdev, error=%d\n", rc);
 		free(b);
 		return NULL;
 	}
@@ -177,6 +233,9 @@ spdk_bdev_create_bs_dev(struct spdk_bdev *bdev)
 	b->bs_dev.destroy = bdev_blob_destroy;
 	b->bs_dev.read = bdev_blob_read;
 	b->bs_dev.write = bdev_blob_write;
+	b->bs_dev.readv = bdev_blob_readv;
+	b->bs_dev.writev = bdev_blob_writev;
+	b->bs_dev.write_zeroes = bdev_blob_write_zeroes;
 	b->bs_dev.unmap = bdev_blob_unmap;
 
 	return &b->bs_dev;

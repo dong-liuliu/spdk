@@ -37,7 +37,7 @@ include $(SPDK_ROOT_DIR)/mk/spdk.common.mk
 include $(SPDK_ROOT_DIR)/mk/spdk.app.mk
 include $(SPDK_ROOT_DIR)/mk/spdk.modules.mk
 
-CXXFLAGS +=  -I$(SPDK_DIR)/include -Iutil/ -Ienv/
+CXXFLAGS +=  -I$(SPDK_DIR)/include -Iinclude/
 
 # The SPDK makefiles turn this on, but RocksDB won't compile with it.  So
 #  turn it off after including the SPDK makefiles.
@@ -46,15 +46,20 @@ CXXFLAGS += -Wno-missing-declarations
 # The SPDK Makefiles may turn these options on but we do not want to enable
 #  them for the RocksDB source files.
 CXXFLAGS += -fno-profile-arcs -fno-test-coverage
+ifeq ($(CONFIG_UBSAN),y)
 CXXFLAGS += -fno-sanitize=undefined
+endif
+ifeq ($(CONFIG_ASAN),y)
 CXXFLAGS += -fno-sanitize=address
+endif
 
-SPDK_LIB_LIST = event_bdev event_copy event_rpc
-SPDK_LIB_LIST += blobfs blob bdev blob_bdev copy event util conf trace \
-		log jsonrpc json rpc
+SPDK_LIB_LIST = event_bdev event_copy
+SPDK_LIB_LIST += blobfs bdev copy event util conf trace \
+		log jsonrpc json rpc thread
 
 AM_LINK += $(COPY_MODULES_LINKER_ARGS) $(BLOCKDEV_MODULES_LINKER_ARGS)
 AM_LINK += $(SPDK_LIB_LINKER_ARGS) $(ENV_LINKER_ARGS)
+AM_LINK += $(SYS_LIBS)
 
 ifeq ($(CONFIG_UBSAN),y)
 AM_LINK += -fsanitize=undefined

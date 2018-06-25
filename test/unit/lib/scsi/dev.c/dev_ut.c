@@ -36,33 +36,25 @@
 #include "CUnit/Basic.h"
 #include "spdk_cunit.h"
 
-#include "dev.c"
-#include "port.c"
+#include "spdk/util.h"
+
+#include "scsi/dev.c"
+#include "scsi/port.c"
 
 /* Unit test bdev mockup */
 struct spdk_bdev {
 	char name[100];
 };
 
-static struct spdk_bdev g_bdev = {};
-
-struct lun_entry {
-	TAILQ_ENTRY(lun_entry) lun_entries;
-	struct spdk_scsi_lun *lun;
+static struct spdk_bdev g_bdevs[] = {
+	{"malloc0"},
+	{"malloc1"},
 };
-TAILQ_HEAD(, lun_entry) g_lun_head;
-
-static int
-test_setup(void)
-{
-	TAILQ_INIT(&g_lun_head);
-	return 0;
-}
 
 const char *
 spdk_bdev_get_name(const struct spdk_bdev *bdev)
 {
-	return "test";
+	return bdev->name;
 }
 
 static struct spdk_scsi_task *
@@ -85,7 +77,7 @@ spdk_scsi_task_put(struct spdk_scsi_task *task)
 }
 
 _spdk_scsi_lun *
-spdk_scsi_lun_construct(const char *name, struct spdk_bdev *bdev,
+spdk_scsi_lun_construct(struct spdk_bdev *bdev,
 			void (*hotremove_cb)(const struct spdk_scsi_lun *, void *),
 			void *hotremove_ctx)
 {
@@ -94,59 +86,29 @@ spdk_scsi_lun_construct(const char *name, struct spdk_bdev *bdev,
 	lun = calloc(1, sizeof(struct spdk_scsi_lun));
 	SPDK_CU_ASSERT_FATAL(lun != NULL);
 
-	snprintf(lun->name, sizeof(lun->name), "%s", name);
 	lun->bdev = bdev;
+
 	return lun;
 }
 
-int
+void
 spdk_scsi_lun_destruct(struct spdk_scsi_lun *lun)
 {
 	free(lun);
-	return 0;
 }
 
 struct spdk_bdev *
 spdk_bdev_get_by_name(const char *bdev_name)
 {
-	snprintf(g_bdev.name, sizeof(g_bdev.name), "%s", bdev_name);
-	return &g_bdev;
-}
+	size_t i;
 
-int
-spdk_scsi_lun_claim(struct spdk_scsi_lun *lun)
-{
-	struct lun_entry *p;
-
-	TAILQ_FOREACH(p, &g_lun_head, lun_entries) {
-		CU_ASSERT_FATAL(p->lun != NULL);
-		if (strncmp(p->lun->name, lun->name, sizeof(lun->name)) == 0)
-			return -1;
-	}
-
-	p = calloc(1, sizeof(struct lun_entry));
-	SPDK_CU_ASSERT_FATAL(p != NULL);
-
-	p->lun = lun;
-
-	TAILQ_INSERT_TAIL(&g_lun_head, p, lun_entries);
-	return 0;
-}
-
-int
-spdk_scsi_lun_unclaim(struct spdk_scsi_lun *lun)
-{
-	struct lun_entry *p, *tmp;
-
-	TAILQ_FOREACH_SAFE(p, &g_lun_head, lun_entries, tmp) {
-		CU_ASSERT_FATAL(p->lun != NULL);
-		if (strncmp(p->lun->name, lun->name, sizeof(lun->name)) == 0) {
-			TAILQ_REMOVE(&g_lun_head, p, lun_entries);
-			free(p);
-			return 0;
+	for (i = 0; i < SPDK_COUNTOF(g_bdevs); i++) {
+		if (strcmp(bdev_name, g_bdevs[i].name) == 0) {
+			return &g_bdevs[i];
 		}
 	}
-	return 0;
+
+	return NULL;
 }
 
 int
@@ -155,14 +117,8 @@ spdk_scsi_lun_task_mgmt_execute(struct spdk_scsi_task *task, enum spdk_scsi_task
 	return 0;
 }
 
-int
-spdk_scsi_lun_append_task(struct spdk_scsi_lun *lun, struct spdk_scsi_task *task)
-{
-	return 0;
-}
-
 void
-spdk_scsi_lun_execute_tasks(struct spdk_scsi_lun *lun)
+spdk_scsi_lun_execute_task(struct spdk_scsi_lun *lun, struct spdk_scsi_task *task)
 {
 }
 
@@ -193,11 +149,9 @@ dev_destruct_null_dev(void)
 static void
 dev_destruct_zero_luns(void)
 {
-	struct spdk_scsi_dev dev = { 0 };
+	struct spdk_scsi_dev dev = { .is_allocated = 1 };
 
-	/* pass maxlun as 0.
-	 * No luns attached to the dev */
-	dev.maxlun = 0;
+	/* No luns attached to the dev */
 
 	/* free the dev */
 	spdk_scsi_dev_destruct(&dev);
@@ -206,9 +160,8 @@ dev_destruct_zero_luns(void)
 static void
 dev_destruct_null_lun(void)
 {
-	struct spdk_scsi_dev dev = { 0 };
+	struct spdk_scsi_dev dev = { .is_allocated = 1 };
 
-	dev.maxlun = 1;
 	/* pass null for the lun */
 	dev.lun[0] = NULL;
 
@@ -219,14 +172,13 @@ dev_destruct_null_lun(void)
 static void
 dev_destruct_success(void)
 {
-	struct spdk_scsi_dev dev = { 0 };
-	struct spdk_scsi_lun *lun;
-
-	lun = calloc(1, sizeof(struct spdk_scsi_lun));
+	struct spdk_scsi_dev dev = { .is_allocated = 1 };
+	int rc;
 
 	/* dev with a single lun */
-	dev.maxlun = 1;
-	dev.lun[0] = lun;
+	rc = spdk_scsi_dev_add_lun(&dev, "malloc0", 0, NULL, NULL);
+
+	CU_ASSERT(rc == 0);
 
 	/* free the dev */
 	spdk_scsi_dev_destruct(&dev);
@@ -237,10 +189,10 @@ static void
 dev_construct_num_luns_zero(void)
 {
 	struct spdk_scsi_dev *dev;
-	char *lun_name_list[1] = {};
+	const char *bdev_name_list[1] = {};
 	int lun_id_list[1] = { 0 };
 
-	dev = spdk_scsi_dev_construct("Name", lun_name_list, lun_id_list, 0,
+	dev = spdk_scsi_dev_construct("Name", bdev_name_list, lun_id_list, 0,
 				      SPDK_SPC_PROTOCOL_IDENTIFIER_ISCSI, NULL, NULL);
 
 	/* dev should be null since we passed num_luns = 0 */
@@ -251,12 +203,12 @@ static void
 dev_construct_no_lun_zero(void)
 {
 	struct spdk_scsi_dev *dev;
-	char *lun_name_list[1] = {};
+	const char *bdev_name_list[1] = {};
 	int lun_id_list[1] = { 0 };
 
 	lun_id_list[0] = 1;
 
-	dev = spdk_scsi_dev_construct("Name", lun_name_list, lun_id_list, 1,
+	dev = spdk_scsi_dev_construct("Name", bdev_name_list, lun_id_list, 1,
 				      SPDK_SPC_PROTOCOL_IDENTIFIER_ISCSI, NULL, NULL);
 
 	/* dev should be null since no LUN0 was specified (lun_id_list[0] = 1) */
@@ -267,10 +219,10 @@ static void
 dev_construct_null_lun(void)
 {
 	struct spdk_scsi_dev *dev;
-	char *lun_name_list[1] = {};
+	const char *bdev_name_list[1] = {};
 	int lun_id_list[1] = { 0 };
 
-	dev = spdk_scsi_dev_construct("Name", lun_name_list, lun_id_list, 1,
+	dev = spdk_scsi_dev_construct("Name", bdev_name_list, lun_id_list, 1,
 				      SPDK_SPC_PROTOCOL_IDENTIFIER_ISCSI, NULL, NULL);
 
 	/* dev should be null since no LUN0 was specified (lun_list[0] = NULL) */
@@ -278,13 +230,31 @@ dev_construct_null_lun(void)
 }
 
 static void
+dev_construct_name_too_long(void)
+{
+	struct spdk_scsi_dev *dev;
+	const char *bdev_name_list[1] = {"malloc0"};
+	int lun_id_list[1] = { 0 };
+	char name[SPDK_SCSI_DEV_MAX_NAME + 1 + 1];
+
+	/* Try to construct a dev with a name that is one byte longer than allowed. */
+	memset(name, 'x', sizeof(name) - 1);
+	name[sizeof(name) - 1] = '\0';
+
+	dev = spdk_scsi_dev_construct(name, bdev_name_list, lun_id_list, 1,
+				      SPDK_SPC_PROTOCOL_IDENTIFIER_ISCSI, NULL, NULL);
+
+	CU_ASSERT(dev == NULL);
+}
+
+static void
 dev_construct_success(void)
 {
 	struct spdk_scsi_dev *dev;
-	char *lun_name_list[1] = {"malloc0"};
+	const char *bdev_name_list[1] = {"malloc0"};
 	int lun_id_list[1] = { 0 };
 
-	dev = spdk_scsi_dev_construct("Name", lun_name_list, lun_id_list, 1,
+	dev = spdk_scsi_dev_construct("Name", bdev_name_list, lun_id_list, 1,
 				      SPDK_SPC_PROTOCOL_IDENTIFIER_ISCSI, NULL, NULL);
 
 	/* Successfully constructs and returns a dev */
@@ -292,60 +262,34 @@ dev_construct_success(void)
 
 	/* free the dev */
 	spdk_scsi_dev_destruct(dev);
-
-	CU_ASSERT(TAILQ_EMPTY(&g_lun_head));
 }
 
 static void
-dev_construct_same_lun_two_devices(void)
-{
-	struct spdk_scsi_dev *dev, *dev2;
-	char *lun_name_list[1] = {"malloc0"};
-	int lun_id_list[1] = { 0 };
-
-	dev = spdk_scsi_dev_construct("Name", lun_name_list, lun_id_list, 1,
-				      SPDK_SPC_PROTOCOL_IDENTIFIER_ISCSI, NULL, NULL);
-
-	/* Successfully constructs and returns a dev */
-	CU_ASSERT_TRUE(dev != NULL);
-
-	dev2 = spdk_scsi_dev_construct("Name2", lun_name_list, lun_id_list, 1,
-				       SPDK_SPC_PROTOCOL_IDENTIFIER_ISCSI, NULL, NULL);
-
-	/* Fails to construct dev and returns NULL */
-	CU_ASSERT_TRUE(dev2 == NULL);
-
-	/* free the dev */
-	spdk_scsi_dev_destruct(dev);
-
-	CU_ASSERT(TAILQ_EMPTY(&g_lun_head));
-}
-
-static void
-dev_construct_same_lun_one_device(void)
+dev_construct_success_lun_zero_not_first(void)
 {
 	struct spdk_scsi_dev *dev;
-	char *lun_name_list[2] = {"malloc0", "malloc0"};
-	int lun_id_list[2] = { 0, 1 };
+	const char *bdev_name_list[2] = {"malloc1", "malloc0"};
+	int lun_id_list[2] = { 1, 0 };
 
-	dev = spdk_scsi_dev_construct("Name", lun_name_list, lun_id_list, 2,
+	dev = spdk_scsi_dev_construct("Name", bdev_name_list, lun_id_list, 2,
 				      SPDK_SPC_PROTOCOL_IDENTIFIER_ISCSI, NULL, NULL);
 
-	/* Fails to construct dev and returns NULL */
-	CU_ASSERT_TRUE(dev == NULL);
+	/* Successfully constructs and returns a dev */
+	CU_ASSERT_TRUE(dev != NULL);
 
-	CU_ASSERT(TAILQ_EMPTY(&g_lun_head));
+	/* free the dev */
+	spdk_scsi_dev_destruct(dev);
 }
 
 static void
 dev_queue_mgmt_task_success(void)
 {
 	struct spdk_scsi_dev *dev;
-	char *lun_name_list[1] = {"malloc0"};
+	const char *bdev_name_list[1] = {"malloc0"};
 	int lun_id_list[1] = { 0 };
 	struct spdk_scsi_task *task;
 
-	dev = spdk_scsi_dev_construct("Name", lun_name_list, lun_id_list, 1,
+	dev = spdk_scsi_dev_construct("Name", bdev_name_list, lun_id_list, 1,
 				      SPDK_SPC_PROTOCOL_IDENTIFIER_ISCSI, NULL, NULL);
 
 	/* Successfully constructs and returns a dev */
@@ -364,11 +308,11 @@ static void
 dev_queue_task_success(void)
 {
 	struct spdk_scsi_dev *dev;
-	char *lun_name_list[1] = {"malloc0"};
+	const char *bdev_name_list[1] = {"malloc0"};
 	int lun_id_list[1] = { 0 };
 	struct spdk_scsi_task *task;
 
-	dev = spdk_scsi_dev_construct("Name", lun_name_list, lun_id_list, 1,
+	dev = spdk_scsi_dev_construct("Name", bdev_name_list, lun_id_list, 1,
 				      SPDK_SPC_PROTOCOL_IDENTIFIER_ISCSI, NULL, NULL);
 
 	/* Successfully constructs and returns a dev */
@@ -423,12 +367,13 @@ dev_add_port_max_ports(void)
 }
 
 static void
-dev_add_port_construct_failure(void)
+dev_add_port_construct_failure1(void)
 {
 	struct spdk_scsi_dev dev = { 0 };
 	const int port_name_length = SPDK_SCSI_PORT_MAX_NAME_LENGTH + 2;
 	char name[port_name_length];
-	int id, rc;
+	uint64_t id;
+	int rc;
 
 	dev.num_ports = 1;
 	/* Set the name such that the length exceeds SPDK_SCSI_PORT_MAX_NAME_LENGTH
@@ -445,7 +390,29 @@ dev_add_port_construct_failure(void)
 }
 
 static void
-dev_add_port_success(void)
+dev_add_port_construct_failure2(void)
+{
+	struct spdk_scsi_dev dev = { 0 };
+	const char *name;
+	uint64_t id;
+	int rc;
+
+	dev.num_ports = 1;
+	name = "Name of Port";
+	id = 1;
+
+	/* Initialize port[0] to be valid and its index is set to 1 */
+	dev.port[0].id = id;
+	dev.port[0].is_used = 1;
+
+	rc = spdk_scsi_dev_add_port(&dev, id, name);
+
+	/* returns -1; since the dev already has a port whose index to be 1 */
+	CU_ASSERT_TRUE(rc < 0);
+}
+
+static void
+dev_add_port_success1(void)
 {
 	struct spdk_scsi_dev dev = { 0 };
 	const char *name;
@@ -460,6 +427,52 @@ dev_add_port_success(void)
 	/* successfully adds a port */
 	CU_ASSERT_EQUAL(rc, 0);
 	/* Assert num_ports has been incremented to  2 */
+	CU_ASSERT_EQUAL(dev.num_ports, 2);
+}
+
+static void
+dev_add_port_success2(void)
+{
+	struct spdk_scsi_dev dev = { 0 };
+	const char *name;
+	uint64_t id;
+	int rc;
+
+	dev.num_ports = 1;
+	name = "Name of Port";
+	id = 1;
+	/* set id of invalid port[0] to 1. This must be ignored */
+	dev.port[0].id = id;
+	dev.port[0].is_used = 0;
+
+	rc = spdk_scsi_dev_add_port(&dev, id, name);
+
+	/* successfully adds a port */
+	CU_ASSERT_EQUAL(rc, 0);
+	/* Assert num_ports has been incremented to 1 */
+	CU_ASSERT_EQUAL(dev.num_ports, 2);
+}
+
+static void
+dev_add_port_success3(void)
+{
+	struct spdk_scsi_dev dev = { 0 };
+	const char *name;
+	uint64_t add_id;
+	int rc;
+
+	dev.num_ports = 1;
+	name = "Name of Port";
+	dev.port[0].id = 1;
+	dev.port[0].is_used = 1;
+	add_id = 2;
+
+	/* Add a port with id = 2 */
+	rc = spdk_scsi_dev_add_port(&dev, add_id, name);
+
+	/* successfully adds a port */
+	CU_ASSERT_EQUAL(rc, 0);
+	/* Assert num_ports has been incremented to 2 */
 	CU_ASSERT_EQUAL(dev.num_ports, 2);
 }
 
@@ -537,17 +550,57 @@ dev_find_port_by_id_success(void)
 }
 
 static void
-dev_print_success(void)
+dev_add_lun_bdev_not_found(void)
 {
-	struct spdk_scsi_dev dev = { 0 };
-	struct spdk_scsi_lun lun = { 0 };
+	int rc;
+	struct spdk_scsi_dev dev = {0};
 
-	dev.maxlun = 1;
-	dev.lun[0] = &lun;
+	rc = spdk_scsi_dev_add_lun(&dev, "malloc2", -1, NULL, NULL);
 
-	/* Prints the dev and a list of the LUNs associated with
-	 * the dev */
-	spdk_scsi_dev_print(&dev);
+	CU_ASSERT_NOT_EQUAL(rc, 0);
+}
+
+static void
+dev_add_lun_no_free_lun_id(void)
+{
+	int rc;
+	int i;
+	struct spdk_scsi_dev dev = {0};
+	struct spdk_scsi_lun lun;
+
+	for (i = 0; i < SPDK_SCSI_DEV_MAX_LUN; i++) {
+		dev.lun[i] = &lun;
+	}
+
+	rc = spdk_scsi_dev_add_lun(&dev, "malloc0", -1, NULL, NULL);
+
+	CU_ASSERT_NOT_EQUAL(rc, 0);
+}
+
+static void
+dev_add_lun_success1(void)
+{
+	int rc;
+	struct spdk_scsi_dev dev = {0};
+
+	rc = spdk_scsi_dev_add_lun(&dev, "malloc0", -1, NULL, NULL);
+
+	CU_ASSERT_EQUAL(rc, 0);
+
+	spdk_scsi_dev_destruct(&dev);
+}
+
+static void
+dev_add_lun_success2(void)
+{
+	int rc;
+	struct spdk_scsi_dev dev = {0};
+
+	rc = spdk_scsi_dev_add_lun(&dev, "malloc0", 0, NULL, NULL);
+
+	CU_ASSERT_EQUAL(rc, 0);
+
+	spdk_scsi_dev_destruct(&dev);
 }
 
 int
@@ -560,7 +613,7 @@ main(int argc, char **argv)
 		return CU_get_error();
 	}
 
-	suite = CU_add_suite("dev_suite", test_setup, NULL);
+	suite = CU_add_suite("dev_suite", NULL, NULL);
 	if (suite == NULL) {
 		CU_cleanup_registry();
 		return CU_get_error();
@@ -578,11 +631,10 @@ main(int argc, char **argv)
 			       dev_construct_no_lun_zero) == NULL
 		|| CU_add_test(suite, "construct  - null lun",
 			       dev_construct_null_lun) == NULL
+		|| CU_add_test(suite, "construct - name too long", dev_construct_name_too_long) == NULL
 		|| CU_add_test(suite, "construct  - success", dev_construct_success) == NULL
-		|| CU_add_test(suite, "construct  - same lun on two devices",
-			       dev_construct_same_lun_two_devices) == NULL
-		|| CU_add_test(suite, "construct  - same lun on once device",
-			       dev_construct_same_lun_one_device) == NULL
+		|| CU_add_test(suite, "construct - success - LUN zero not first",
+			       dev_construct_success_lun_zero_not_first) == NULL
 		|| CU_add_test(suite, "dev queue task mgmt - success",
 			       dev_queue_mgmt_task_success) == NULL
 		|| CU_add_test(suite, "dev queue task - success",
@@ -590,17 +642,30 @@ main(int argc, char **argv)
 		|| CU_add_test(suite, "dev stop - success", dev_stop_success) == NULL
 		|| CU_add_test(suite, "dev add port - max ports",
 			       dev_add_port_max_ports) == NULL
-		|| CU_add_test(suite, "dev add port - construct port failure",
-			       dev_add_port_construct_failure) == NULL
-		|| CU_add_test(suite, "dev add port - success",
-			       dev_add_port_success) == NULL
+		|| CU_add_test(suite, "dev add port - construct port failure 1",
+			       dev_add_port_construct_failure1) == NULL
+		|| CU_add_test(suite, "dev add port - construct port failure 2",
+			       dev_add_port_construct_failure2) == NULL
+		|| CU_add_test(suite, "dev add port - success 1",
+			       dev_add_port_success1) == NULL
+		|| CU_add_test(suite, "dev add port - success 2",
+			       dev_add_port_success2) == NULL
+		|| CU_add_test(suite, "dev add port - success 3",
+			       dev_add_port_success3) == NULL
 		|| CU_add_test(suite, "dev find port by id - num ports zero",
 			       dev_find_port_by_id_num_ports_zero) == NULL
 		|| CU_add_test(suite, "dev find port by id - different port id failure",
 			       dev_find_port_by_id_id_not_found_failure) == NULL
 		|| CU_add_test(suite, "dev find port by id - success",
 			       dev_find_port_by_id_success) == NULL
-		|| CU_add_test(suite, "dev print - success", dev_print_success) == NULL
+		|| CU_add_test(suite, "dev add lun - bdev not found",
+			       dev_add_lun_bdev_not_found) == NULL
+		|| CU_add_test(suite, "dev add lun - no free lun id",
+			       dev_add_lun_no_free_lun_id) == NULL
+		|| CU_add_test(suite, "dev add lun - success 1",
+			       dev_add_lun_success1) == NULL
+		|| CU_add_test(suite, "dev add lun - success 2",
+			       dev_add_lun_success2) == NULL
 	) {
 		CU_cleanup_registry();
 		return CU_get_error();

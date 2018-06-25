@@ -2,6 +2,7 @@
 #  BSD LICENSE
 #
 #  Copyright (c) Intel Corporation.
+#  Copyright (c) 2017, IBM Corporation.
 #  All rights reserved.
 #
 #  Redistribution and use in source and binary forms, with or without
@@ -36,19 +37,45 @@ include $(SPDK_ROOT_DIR)/CONFIG
 
 -include $(SPDK_ROOT_DIR)/mk/cc.mk
 
-C_OPT ?= -fno-omit-frame-pointer
 ifneq ($(V),1)
 Q ?= @
 endif
 S ?= $(notdir $(CURDIR))
 
+DESTDIR?=
+
+ifneq ($(prefix),)
+CONFIG_PREFIX=$(prefix)
+endif
+
+bindir?=$(CONFIG_PREFIX)/bin
+libdir?=$(CONFIG_PREFIX)/lib
+includedir?=$(CONFIG_PREFIX)/include
+
 ifeq ($(MAKECMDGOALS),)
 MAKECMDGOALS=$(.DEFAULT_GOAL)
 endif
 
-OS := $(shell uname)
+TARGET_TRIPLET := $(shell $(CC) -dumpmachine)
+TARGET_TRIPLET_WORDS := $(subst -, ,$(TARGET_TRIPLET))
 
-COMMON_CFLAGS = -g $(C_OPT) -Wall -Wextra -Wno-unused-parameter -Wno-missing-field-initializers -Wmissing-declarations -fno-strict-aliasing -march=native -m64 -I$(SPDK_ROOT_DIR)/include
+ifneq ($(filter linux%,$(TARGET_TRIPLET_WORDS)),)
+OS = Linux
+endif
+ifneq ($(filter freebsd%,$(TARGET_TRIPLET_WORDS)),)
+OS = FreeBSD
+endif
+
+TARGET_MACHINE := $(firstword $(TARGET_TRIPLET_WORDS))
+
+COMMON_CFLAGS = -g $(C_OPT) -Wall -Wextra -Wno-unused-parameter -Wno-missing-field-initializers -Wmissing-declarations -fno-strict-aliasing -I$(SPDK_ROOT_DIR)/include
+
+ifneq ($(filter powerpc%,$(TARGET_MACHINE)),)
+COMMON_CFLAGS += -mcpu=native
+endif
+ifeq ($(TARGET_MACHINE),x86_64)
+COMMON_CFLAGS += -march=native
+endif
 
 COMMON_CFLAGS += -include $(SPDK_ROOT_DIR)/config.h
 
@@ -87,8 +114,45 @@ LIBS += -L/usr/local/lib
 COMMON_CFLAGS += -I/usr/local/include
 endif
 
+# Attach only if PMDK lib specified with configure
+ifneq ($(CONFIG_PMDK_DIR),)
+LIBS += -L$(CONFIG_PMDK_DIR)/src/nondebug
+COMMON_CFLAGS += -I$(CONFIG_PMDK_DIR)/src/include
+endif
+
+ifneq ($(CONFIG_VPP_DIR),)
+LIBS += -L$(CONFIG_VPP_DIR)/lib64
+COMMON_CFLAGS += -I$(CONFIG_VPP_DIR)/include
+endif
+
+#Attach only if FreeBSD and RDMA is specified with configure
+ifeq ($(OS),FreeBSD)
+ifeq ($(CONFIG_RDMA),y)
+# RDMA Userspace Verbs Library
+ifneq ("$(wildcard /usr/lib/libibverbs.*)","")
+LIBS += -libverbs
+endif
+# RDMA Connection Manager Library
+ifneq ("$(wildcard /usr/lib/librdmacm.*)","")
+LIBS += -lrdmacm
+endif
+# Mellanox - MLX4 HBA Userspace Library
+ifneq ("$(wildcard /usr/lib/libmlx4.*)","")
+LIBS += -lmlx4
+endif
+# Mellanox - MLX5 HBA Userspace Library
+ifneq ("$(wildcard /usr/lib/libmlx5.*)","")
+LIBS += -lmlx5
+endif
+# Chelsio HBA Userspace Library
+ifneq ("$(wildcard /usr/lib/libcxgb4.*)","")
+LIBS += -lcxgb4
+endif
+endif
+endif
+
 ifeq ($(CONFIG_DEBUG), y)
-COMMON_CFLAGS += -DDEBUG -O0
+COMMON_CFLAGS += -DDEBUG -O0 -fno-omit-frame-pointer
 else
 COMMON_CFLAGS += -DNDEBUG -O2
 # Enable _FORTIFY_SOURCE checks - these only work when optimizations are enabled.
@@ -127,6 +191,8 @@ CFLAGS   += $(COMMON_CFLAGS) -Wno-pointer-sign -Wstrict-prototypes -Wold-style-d
 CXXFLAGS += $(COMMON_CFLAGS) -std=c++0x
 
 SYS_LIBS += -lrt
+SYS_LIBS += -luuid
+SYS_LIBS += -lcrypto
 
 MAKEFLAGS += --no-print-directory
 
@@ -141,12 +207,12 @@ DEPFLAGS = -MMD -MP -MF $*.d.tmp
 COMPILE_C=\
 	$(Q)echo "  CC $S/$@"; \
 	$(CC) -o $@ $(DEPFLAGS) $(CFLAGS) -c $< && \
-	mv -f $*.d.tmp $*.d
+	mv -f $*.d.tmp $*.d && touch -c $@
 
 COMPILE_CXX=\
 	$(Q)echo "  CXX $S/$@"; \
 	$(CXX) -o $@ $(DEPFLAGS) $(CXXFLAGS) -c $< && \
-	mv -f $*.d.tmp $*.d
+	mv -f $*.d.tmp $*.d && touch -c $@
 
 # Link $(OBJS) and $(LIBS) into $@ (app)
 LINK_C=\
@@ -167,6 +233,30 @@ LIB_C=\
 CLEAN_C=\
 	$(Q)rm -f *.a *.o *.d *.d.tmp *.gcno *.gcda
 
+# Install a library
+INSTALL_LIB=\
+	$(Q)echo "  INSTALL $(DESTDIR)$(libdir)/$(notdir $(LIB))"; \
+	install -d -m 755 "$(DESTDIR)$(libdir)"; \
+	install -m 644 "$(LIB)" "$(DESTDIR)$(libdir)/"
+
+# Install a shared library
+INSTALL_SHARED_LIB=\
+	$(Q)echo "  INSTALL $(DESTDIR)$(libdir)/$(notdir $(SHARED_LIB))"; \
+	install -d -m 755 "$(DESTDIR)$(libdir)"; \
+	install -m 644 "$(SHARED_LIB)" "$(DESTDIR)$(libdir)/"
+
+# Install an app binary
+INSTALL_APP=\
+	$(Q)echo "  INSTALL $(DESTDIR)$(bindir)/$(APP)"; \
+	install -d -m 755 "$(DESTDIR)$(bindir)"; \
+	install -m 755 "$(APP)" "$(DESTDIR)$(bindir)/"
+
+# Install a header
+INSTALL_HEADER=\
+	$(Q)echo "  INSTALL $@"; \
+	install -d -m 755 "$(DESTDIR)$(includedir)/$(dir $(patsubst $(DESTDIR)$(includedir)/%,%,$@))"; \
+	install -m 644 "$(patsubst $(DESTDIR)$(includedir)/%,%,$@)" "$(DESTDIR)$(includedir)/$(dir $(patsubst $(DESTDIR)$(includedir)/%,%,$@))/"
+
 %.o: %.c %.d $(MAKEFILE_LIST)
 	$(COMPILE_C)
 
@@ -176,5 +266,5 @@ CLEAN_C=\
 %.d: ;
 
 define spdk_lib_list_to_files
-	$(1:%=$(SPDK_ROOT_DIR)/build/lib/libspdk_%.a)
+$(1:%=$(SPDK_ROOT_DIR)/build/lib/libspdk_%.a)
 endef

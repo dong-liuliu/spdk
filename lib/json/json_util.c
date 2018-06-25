@@ -31,7 +31,9 @@
  *   OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 
-#include "json_internal.h"
+#include "spdk/json.h"
+
+#include "spdk_internal/utf.h"
 
 size_t
 spdk_json_val_len(const struct spdk_json_val *val)
@@ -200,6 +202,28 @@ spdk_json_number_split(const struct spdk_json_val *val, struct spdk_json_num *nu
 }
 
 int
+spdk_json_number_to_uint16(const struct spdk_json_val *val, uint16_t *num)
+{
+	struct spdk_json_num split_num;
+	int rc;
+
+	rc = spdk_json_number_split(val, &split_num);
+	if (rc) {
+		return rc;
+	}
+
+	if (split_num.exponent || split_num.negative) {
+		return -ERANGE;
+	}
+
+	if (split_num.significand > UINT16_MAX) {
+		return -ERANGE;
+	}
+	*num = (uint16_t)split_num.significand;
+	return 0;
+}
+
+int
 spdk_json_number_to_int32(const struct spdk_json_val *val, int32_t *num)
 {
 	struct spdk_json_num split_num;
@@ -340,19 +364,21 @@ spdk_json_decode_array(const struct spdk_json_val *values, spdk_json_decode_fn d
 {
 	uint32_t i;
 	char *field;
+	char *out_end;
 
 	if (values == NULL || values->type != SPDK_JSON_VAL_ARRAY_BEGIN) {
 		return -1;
 	}
 
-	if (values->len > max_size) {
-		return -1;
-	}
-
 	*out_size = 0;
 	field = out;
+	out_end = field + max_size * stride;
 	for (i = 0; i < values->len;) {
 		const struct spdk_json_val *v = &values[i + 1];
+
+		if (field == out_end) {
+			return -1;
+		}
 
 		if (decode_func(v, field)) {
 			return -1;
@@ -377,6 +403,14 @@ spdk_json_decode_bool(const struct spdk_json_val *val, void *out)
 
 	*f = val->type == SPDK_JSON_VAL_TRUE;
 	return 0;
+}
+
+int
+spdk_json_decode_uint16(const struct spdk_json_val *val, void *out)
+{
+	uint16_t *i = out;
+
+	return spdk_json_number_to_uint16(val, i);
 }
 
 int

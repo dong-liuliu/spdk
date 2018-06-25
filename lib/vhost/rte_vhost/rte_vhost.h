@@ -44,6 +44,7 @@
 #include <linux/virtio_ring.h>
 #include <sys/eventfd.h>
 
+#include <rte_config.h>
 #include <rte_memory.h>
 #include <rte_mempool.h>
 
@@ -103,8 +104,18 @@ struct vhost_device_ops {
 	 * is used to inform the application on such change.
 	 */
 	int (*features_changed)(int vid, uint64_t features);
+	int (*vhost_nvme_admin_passthrough)(int vid, void *cmd, void *cqe, void *buf);
+	int (*vhost_nvme_set_cq_call)(int vid, uint16_t qid, int fd);
+	int (*vhost_nvme_get_cap)(int vid, uint64_t *cap);
 
-	void *reserved[4]; /**< Reserved for future extension */
+	int (*new_connection)(int vid);
+	void (*destroy_connection)(int vid);
+
+	int (*get_config)(int vid, uint8_t *config, uint32_t config_len);
+	int (*set_config)(int vid, uint8_t *config, uint32_t offset,
+			  uint32_t len, uint32_t flags);
+
+	void *reserved[2]; /**< Reserved for future extension */
 };
 
 /**
@@ -131,6 +142,46 @@ rte_vhost_gpa_to_vva(struct rte_vhost_memory *mem, uint64_t gpa)
 			       reg->host_user_addr;
 		}
 	}
+
+	return 0;
+}
+
+/**
+ * Convert guest physical address to host virtual address safely
+ *
+ * This variant of rte_vhost_gpa_to_vva() takes care all the
+ * requested length is mapped and contiguous in process address
+ * space.
+ *
+ * @param mem
+ *  the guest memory regions
+ * @param gpa
+ *  the guest physical address for querying
+ * @param len
+ *  the size of the requested area to map,
+ *  updated with actual size mapped
+ * @return
+ *  the host virtual address on success, 0 on failure  */
+static inline uint64_t
+rte_vhost_va_from_guest_pa(struct rte_vhost_memory *mem,
+	uint64_t gpa, uint64_t *len)
+{
+	struct rte_vhost_mem_region *r;
+	uint32_t i;
+
+	for (i = 0; i < mem->nregions; i++) {
+		r = &mem->regions[i];
+		if (gpa >= r->guest_phys_addr &&
+		    gpa <  r->guest_phys_addr + r->size) {
+
+			if (unlikely(*len > r->guest_phys_addr + r->size - gpa))
+				*len = r->guest_phys_addr + r->size - gpa;
+
+			return gpa - r->guest_phys_addr +
+			       r->host_user_addr;
+		}
+	}
+	*len = 0;
 
 	return 0;
 }
@@ -297,34 +348,6 @@ int rte_vhost_get_mtu(int vid, uint16_t *mtu);
  *  The numa node, -1 on failure
  */
 int rte_vhost_get_numa_node(int vid);
-
-/**
- * @deprecated
- * Get the number of queues the device supports.
- *
- * Note this function is deprecated, as it returns a queue pair number,
- * which is vhost specific. Instead, rte_vhost_get_vring_num should
- * be used.
- *
- * @param vid
- *  vhost device ID
- *
- * @return
- *  The number of queues, 0 on failure
- */
-__rte_deprecated
-uint32_t rte_vhost_get_queue_num(int vid);
-
-/**
- * Get the number of vrings the device supports.
- *
- * @param vid
- *  vhost device ID
- *
- * @return
- *  The number of vrings, 0 on failure
- */
-uint16_t rte_vhost_get_vring_num(int vid);
 
 /**
  * Get the virtio net device's ifname, which is the vhost-user socket

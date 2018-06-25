@@ -41,6 +41,10 @@
 
 #include "spdk/stdinc.h"
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 enum spdk_json_val_type {
 	SPDK_JSON_VAL_INVALID,
 	SPDK_JSON_VAL_NULL,
@@ -143,6 +147,7 @@ int spdk_json_decode_array(const struct spdk_json_val *values, spdk_json_decode_
 			   void *out, size_t max_size, size_t *out_size, size_t stride);
 
 int spdk_json_decode_bool(const struct spdk_json_val *val, void *out);
+int spdk_json_decode_uint16(const struct spdk_json_val *val, void *out);
 int spdk_json_decode_int32(const struct spdk_json_val *val, void *out);
 int spdk_json_decode_uint32(const struct spdk_json_val *val, void *out);
 int spdk_json_decode_uint64(const struct spdk_json_val *val, void *out);
@@ -177,6 +182,7 @@ bool spdk_json_strequal(const struct spdk_json_val *val, const char *str);
  */
 char *spdk_json_strdup(const struct spdk_json_val *val);
 
+int spdk_json_number_to_uint16(const struct spdk_json_val *val, uint16_t *num);
 int spdk_json_number_to_int32(const struct spdk_json_val *val, int32_t *num);
 int spdk_json_number_to_uint32(const struct spdk_json_val *val, uint32_t *num);
 int spdk_json_number_to_uint64(const struct spdk_json_val *val, uint64_t *num);
@@ -198,8 +204,31 @@ int spdk_json_write_int64(struct spdk_json_write_ctx *w, int64_t val);
 int spdk_json_write_uint64(struct spdk_json_write_ctx *w, uint64_t val);
 int spdk_json_write_string(struct spdk_json_write_ctx *w, const char *val);
 int spdk_json_write_string_raw(struct spdk_json_write_ctx *w, const char *val, size_t len);
+
+/**
+ * Write null-terminated UTF-16LE string.
+ *
+ * \param w JSON write context.
+ * \param val UTF-16LE string; must be null terminated.
+ * \return 0 on success or negative on failure.
+ */
+int spdk_json_write_string_utf16le(struct spdk_json_write_ctx *w, const uint16_t *val);
+
+/**
+ * Write UTF-16LE string.
+ *
+ * \param w JSON write context.
+ * \param val UTF-16LE string; may contain embedded null characters.
+ * \param len Length of val in 16-bit code units (i.e. size of string in bytes divided by 2).
+ * \return 0 on success or negative on failure.
+ */
+int spdk_json_write_string_utf16le_raw(struct spdk_json_write_ctx *w, const uint16_t *val,
+				       size_t len);
+
 int spdk_json_write_string_fmt(struct spdk_json_write_ctx *w, const char *fmt,
 			       ...) __attribute__((__format__(__printf__, 2, 3)));
+int spdk_json_write_string_fmt_v(struct spdk_json_write_ctx *w, const char *fmt, va_list args);
+
 int spdk_json_write_array_begin(struct spdk_json_write_ctx *w);
 int spdk_json_write_array_end(struct spdk_json_write_ctx *w);
 int spdk_json_write_object_begin(struct spdk_json_write_ctx *w);
@@ -215,5 +244,25 @@ int spdk_json_write_val(struct spdk_json_write_ctx *w, const struct spdk_json_va
  * Can be used to write values with specific encodings that differ from the JSON writer output.
  */
 int spdk_json_write_val_raw(struct spdk_json_write_ctx *w, const void *data, size_t len);
+
+/* Utility functions */
+int spdk_json_write_named_null(struct spdk_json_write_ctx *w, const char *name);
+int spdk_json_write_named_bool(struct spdk_json_write_ctx *w, const char *name, bool val);
+int spdk_json_write_named_int32(struct spdk_json_write_ctx *w, const char *name, int32_t val);
+int spdk_json_write_named_uint32(struct spdk_json_write_ctx *w, const char *name, uint32_t val);
+int spdk_json_write_named_uint64(struct spdk_json_write_ctx *w, const char *name, uint64_t val);
+int spdk_json_write_named_int64(struct spdk_json_write_ctx *w, const char *name, int64_t val);
+int spdk_json_write_named_string(struct spdk_json_write_ctx *w, const char *name, const char *val);
+int spdk_json_write_named_string_fmt(struct spdk_json_write_ctx *w, const char *name,
+				     const char *fmt, ...) __attribute__((__format__(__printf__, 3, 4)));
+int spdk_json_write_named_string_fmt_v(struct spdk_json_write_ctx *w, const char *name,
+				       const char *fmt, va_list args);
+
+int spdk_json_write_named_array_begin(struct spdk_json_write_ctx *w, const char *name);
+int spdk_json_write_named_object_begin(struct spdk_json_write_ctx *w, const char *name);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif

@@ -35,6 +35,7 @@
 
 #include "spdk/endian.h"
 #include "spdk/scsi.h"
+#include "spdk_cunit.h"
 
 #include "CUnit/Basic.h"
 
@@ -45,18 +46,31 @@
 #include "iscsi/portal_grp.h"
 #include "scsi/scsi_internal.h"
 
+#define UT_TARGET_NAME1		"iqn.2017-11.spdk.io:t0001"
+#define UT_TARGET_NAME2		"iqn.2017-11.spdk.io:t0002"
+#define UT_INITIATOR_NAME1	"iqn.2017-11.spdk.io:i0001"
+#define UT_INITIATOR_NAME2	"iqn.2017-11.spdk.io:i0002"
+
 struct spdk_iscsi_tgt_node *
 spdk_iscsi_find_tgt_node(const char *target_name)
 {
-	return NULL;
+	if (strcasecmp(target_name, UT_TARGET_NAME1) == 0) {
+		return (struct spdk_iscsi_tgt_node *)1;
+	} else {
+		return NULL;
+	}
 }
 
-int
+bool
 spdk_iscsi_tgt_node_access(struct spdk_iscsi_conn *conn,
 			   struct spdk_iscsi_tgt_node *target,
 			   const char *iqn, const char *addr)
 {
-	return 0;
+	if (strcasecmp(conn->initiator_name, UT_INITIATOR_NAME1) == 0) {
+		return true;
+	} else {
+		return false;
+	}
 }
 
 int
@@ -68,14 +82,13 @@ spdk_iscsi_send_tgts(struct spdk_iscsi_conn *conn, const char *iiqn,
 }
 
 void
-spdk_iscsi_acceptor_stop(void)
+spdk_iscsi_portal_grp_close_all(void)
 {
 }
 
-int
-spdk_iscsi_portal_grp_close_all(void)
+void
+spdk_iscsi_conn_migration(struct spdk_iscsi_conn *conn)
 {
-	return 0;
 }
 
 void
@@ -92,11 +105,44 @@ spdk_scsi_lun_get_id(const struct spdk_scsi_lun *lun)
 struct spdk_scsi_lun *
 spdk_scsi_dev_get_lun(struct spdk_scsi_dev *dev, int lun_id)
 {
-	if (lun_id < 0 || lun_id > dev->maxlun) {
+	if (lun_id < 0 || lun_id >= SPDK_SCSI_DEV_MAX_LUN) {
 		return NULL;
 	}
 
 	return dev->lun[lun_id];
+}
+
+static void
+op_login_check_target_test(void)
+{
+	struct spdk_iscsi_conn conn;
+	struct spdk_iscsi_pdu rsp_pdu;
+	struct spdk_iscsi_tgt_node *target;
+	int rc;
+
+	/* expect sucess */
+	snprintf(conn.initiator_name, sizeof(conn.initiator_name),
+		 "%s", UT_INITIATOR_NAME1);
+
+	rc = spdk_iscsi_op_login_check_target(&conn, &rsp_pdu,
+					      UT_TARGET_NAME1, &target);
+	CU_ASSERT(rc == 0);
+
+	/* expect failure */
+	snprintf(conn.initiator_name, sizeof(conn.initiator_name),
+		 "%s", UT_INITIATOR_NAME1);
+
+	rc = spdk_iscsi_op_login_check_target(&conn, &rsp_pdu,
+					      UT_TARGET_NAME2, &target);
+	CU_ASSERT(rc != 0);
+
+	/* expect failure */
+	snprintf(conn.initiator_name, sizeof(conn.initiator_name),
+		 "%s", UT_INITIATOR_NAME2);
+
+	rc = spdk_iscsi_op_login_check_target(&conn, &rsp_pdu,
+					      UT_TARGET_NAME1, &target);
+	CU_ASSERT(rc != 0);
 }
 
 static void
@@ -128,7 +174,6 @@ maxburstlength_test(void)
 
 	lun.id = 0;
 
-	dev.maxlun = 1;
 	dev.lun[0] = &lun;
 
 	conn.full_feature = 1;
@@ -138,6 +183,8 @@ maxburstlength_test(void)
 	TAILQ_INIT(&conn.write_pdu_list);
 	TAILQ_INIT(&conn.active_r2t_tasks);
 
+	TAILQ_INIT(&g_write_pdu_list);
+
 	req_pdu->bhs.opcode = ISCSI_OP_SCSI;
 	req_pdu->data_segment_len = 0;
 
@@ -146,22 +193,20 @@ maxburstlength_test(void)
 	to_be32(&req->cmd_sn, 0);
 	to_be32(&req->expected_data_xfer_len, 1028);
 	to_be32(&req->itt, 0x1234);
-	req->write = 1;
-	req->final = 1;
-
-	g_spdk_iscsi.MaxRecvDataSegmentLength = 1024;
+	req->write_bit = 1;
+	req->final_bit = 1;
 
 	rc = spdk_iscsi_execute(&conn, req_pdu);
 	CU_ASSERT_FATAL(rc == 0);
 
-	response_pdu = TAILQ_FIRST(&conn.write_pdu_list);
-	CU_ASSERT(response_pdu != NULL);
+	response_pdu = TAILQ_FIRST(&g_write_pdu_list);
+	SPDK_CU_ASSERT_FATAL(response_pdu != NULL);
 
 	/*
 	 * Confirm that a correct R2T reply was sent in reponse to the
 	 *  SCSI request.
 	 */
-	TAILQ_REMOVE(&conn.write_pdu_list, response_pdu, tailq);
+	TAILQ_REMOVE(&g_write_pdu_list, response_pdu, tailq);
 	CU_ASSERT(response_pdu->bhs.opcode == ISCSI_OP_R2T);
 	r2t = (struct iscsi_bhs_r2t *)&response_pdu->bhs;
 	CU_ASSERT(from_be32(&r2t->desired_xfer_len) == 1024);
@@ -184,9 +229,9 @@ maxburstlength_test(void)
 	spdk_iscsi_task_put(response_pdu->task);
 	spdk_put_pdu(response_pdu);
 
-	r2t_pdu = TAILQ_FIRST(&conn.write_pdu_list);
+	r2t_pdu = TAILQ_FIRST(&g_write_pdu_list);
 	CU_ASSERT(r2t_pdu != NULL);
-	TAILQ_REMOVE(&conn.write_pdu_list, r2t_pdu, tailq);
+	TAILQ_REMOVE(&g_write_pdu_list, r2t_pdu, tailq);
 	spdk_put_pdu(r2t_pdu);
 
 	spdk_put_pdu(data_out_pdu);
@@ -210,7 +255,8 @@ main(int argc, char **argv)
 	}
 
 	if (
-		CU_add_test(suite, "maxburstlength test", maxburstlength_test) == NULL
+		CU_add_test(suite, "login check target test", op_login_check_target_test) == NULL
+		|| CU_add_test(suite, "maxburstlength test", maxburstlength_test) == NULL
 	) {
 		CU_cleanup_registry();
 		return CU_get_error();

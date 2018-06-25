@@ -55,6 +55,21 @@ spdk_env_get_first_core(void)
 }
 
 uint32_t
+spdk_env_get_last_core(void)
+{
+	uint32_t i;
+	uint32_t last_core = UINT32_MAX;
+
+	SPDK_ENV_FOREACH_CORE(i) {
+		last_core = i;
+	}
+
+	assert(last_core != UINT32_MAX);
+
+	return last_core;
+}
+
+uint32_t
 spdk_env_get_next_core(uint32_t prev_core)
 {
 	unsigned lcore;

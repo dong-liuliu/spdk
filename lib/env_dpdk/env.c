@@ -42,24 +42,66 @@
 #include <rte_memzone.h>
 #include <rte_version.h>
 
-void *
-spdk_dma_malloc_socket(size_t size, size_t align, uint64_t *phys_addr, int socket_id)
+static uint64_t
+virt_to_phys(void *vaddr)
 {
+	uint64_t ret;
+
+#if RTE_VERSION >= RTE_VERSION_NUM(17, 11, 0, 3)
+	ret = rte_malloc_virt2iova(vaddr);
+	if (ret != RTE_BAD_IOVA) {
+		return ret;
+	}
+#else
+	ret = rte_malloc_virt2phy(vaddr);
+	if (ret != RTE_BAD_PHYS_ADDR) {
+		return ret;
+	}
+#endif
+
+	return spdk_vtophys(vaddr);
+}
+
+void *
+spdk_malloc(size_t size, size_t align, uint64_t *phys_addr, int socket_id, uint32_t flags)
+{
+	if (flags == 0) {
+		return NULL;
+	}
+
 	void *buf = rte_malloc_socket(NULL, size, align, socket_id);
 	if (buf && phys_addr) {
-		*phys_addr = rte_malloc_virt2phy(buf);
+		*phys_addr = virt_to_phys(buf);
 	}
 	return buf;
 }
 
 void *
-spdk_dma_zmalloc_socket(size_t size, size_t align, uint64_t *phys_addr, int socket_id)
+spdk_zmalloc(size_t size, size_t align, uint64_t *phys_addr, int socket_id, uint32_t flags)
 {
-	void *buf = spdk_dma_malloc_socket(size, align, phys_addr, socket_id);
+	void *buf = spdk_malloc(size, align, phys_addr, socket_id, flags);
 	if (buf) {
 		memset(buf, 0, size);
 	}
 	return buf;
+}
+
+void
+spdk_free(void *buf)
+{
+	rte_free(buf);
+}
+
+void *
+spdk_dma_malloc_socket(size_t size, size_t align, uint64_t *phys_addr, int socket_id)
+{
+	return spdk_malloc(size, align, phys_addr, socket_id, (SPDK_MALLOC_DMA | SPDK_MALLOC_SHARE));
+}
+
+void *
+spdk_dma_zmalloc_socket(size_t size, size_t align, uint64_t *phys_addr, int socket_id)
+{
+	return spdk_zmalloc(size, align, phys_addr, socket_id, (SPDK_MALLOC_DMA | SPDK_MALLOC_SHARE));
 }
 
 void *
@@ -79,7 +121,7 @@ spdk_dma_realloc(void *buf, size_t size, size_t align, uint64_t *phys_addr)
 {
 	void *new_buf = rte_realloc(buf, size, align);
 	if (new_buf && phys_addr) {
-		*phys_addr = rte_malloc_virt2phy(new_buf);
+		*phys_addr = virt_to_phys(new_buf);
 	}
 	return new_buf;
 }
@@ -87,7 +129,7 @@ spdk_dma_realloc(void *buf, size_t size, size_t align, uint64_t *phys_addr)
 void
 spdk_dma_free(void *buf)
 {
-	rte_free(buf);
+	spdk_free(buf);
 }
 
 void *
@@ -140,8 +182,9 @@ spdk_memzone_dump(FILE *f)
 }
 
 struct spdk_mempool *
-spdk_mempool_create(const char *name, size_t count,
-		    size_t ele_size, size_t cache_size, int socket_id)
+spdk_mempool_create_ctor(const char *name, size_t count,
+			 size_t ele_size, size_t cache_size, int socket_id,
+			 spdk_mempool_obj_cb_t *obj_init, void *obj_init_arg)
 {
 	struct rte_mempool *mp;
 	size_t tmp;
@@ -161,10 +204,25 @@ spdk_mempool_create(const char *name, size_t count,
 	}
 
 	mp = rte_mempool_create(name, count, ele_size, cache_size,
-				0, NULL, NULL, NULL, NULL,
-				socket_id, 0);
+				0, NULL, NULL, (rte_mempool_obj_cb_t *)obj_init, obj_init_arg,
+				socket_id, MEMPOOL_F_NO_PHYS_CONTIG);
 
 	return (struct spdk_mempool *)mp;
+}
+
+
+struct spdk_mempool *
+spdk_mempool_create(const char *name, size_t count,
+		    size_t ele_size, size_t cache_size, int socket_id)
+{
+	return spdk_mempool_create_ctor(name, count, ele_size, cache_size, socket_id,
+					NULL, NULL);
+}
+
+char *
+spdk_mempool_get_name(struct spdk_mempool *mp)
+{
+	return ((struct rte_mempool *)mp)->name;
 }
 
 void
@@ -179,10 +237,19 @@ void *
 spdk_mempool_get(struct spdk_mempool *mp)
 {
 	void *ele = NULL;
+	int rc;
 
-	rte_mempool_get((struct rte_mempool *)mp, &ele);
-
+	rc = rte_mempool_get((struct rte_mempool *)mp, &ele);
+	if (rc != 0) {
+		return NULL;
+	}
 	return ele;
+}
+
+int
+spdk_mempool_get_bulk(struct spdk_mempool *mp, void **ele_arr, size_t count)
+{
+	return rte_mempool_get_bulk((struct rte_mempool *)mp, ele_arr, count);
 }
 
 void
@@ -295,6 +362,12 @@ void
 spdk_ring_free(struct spdk_ring *ring)
 {
 	rte_ring_free((struct rte_ring *)ring);
+}
+
+size_t
+spdk_ring_count(struct spdk_ring *ring)
+{
+	return rte_ring_count((struct rte_ring *)ring);
 }
 
 size_t

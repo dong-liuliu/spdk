@@ -33,9 +33,6 @@
 
 #include "spdk/stdinc.h"
 
-#include <rte_config.h>
-#include <rte_launch.h>
-
 #include "spdk/ioat.h"
 #include "spdk/env.h"
 #include "spdk/queue.h"
@@ -73,7 +70,7 @@ struct ioat_chan_entry {
 };
 
 struct worker_thread {
-	struct ioat_chan_entry 	*ctx;
+	struct ioat_chan_entry	*ctx;
 	struct worker_thread	*next;
 	unsigned		core;
 };
@@ -388,7 +385,9 @@ init(void)
 	spdk_env_opts_init(&opts);
 	opts.name = "perf";
 	opts.core_mask = g_user_config.core_mask;
-	spdk_env_init(&opts);
+	if (spdk_env_init(&opts) < 0) {
+		return -1;
+	}
 
 	return 0;
 }
@@ -468,9 +467,11 @@ associate_workers_with_chan(void)
 		t->ioat_chan_id = i;
 		snprintf(buf_pool_name, sizeof(buf_pool_name), "buf_pool_%d", i);
 		snprintf(task_pool_name, sizeof(task_pool_name), "task_pool_%d", i);
-		t->data_pool = spdk_mempool_create(buf_pool_name, 512, g_user_config.xfer_size_bytes, -1,
+		t->data_pool = spdk_mempool_create(buf_pool_name, 512, g_user_config.xfer_size_bytes,
+						   SPDK_MEMPOOL_DEFAULT_CACHE_SIZE,
 						   SPDK_ENV_SOCKET_ID_ANY);
-		t->task_pool = spdk_mempool_create(task_pool_name, 512, sizeof(struct ioat_task), -1,
+		t->task_pool = spdk_mempool_create(task_pool_name, 512, sizeof(struct ioat_task),
+						   SPDK_MEMPOOL_DEFAULT_CACHE_SIZE,
 						   SPDK_ENV_SOCKET_ID_ANY);
 		if (!t->data_pool || !t->task_pool) {
 			fprintf(stderr, "Could not allocate buffer pool.\n");
@@ -548,7 +549,7 @@ main(int argc, char **argv)
 	worker = g_workers;
 	while (worker != NULL) {
 		if (worker->core != master_core) {
-			rte_eal_remote_launch(work_fn, worker, worker->core);
+			spdk_env_thread_launch_pinned(worker->core, work_fn, worker);
 		} else {
 			assert(master_worker == NULL);
 			master_worker = worker;
@@ -562,7 +563,7 @@ main(int argc, char **argv)
 		goto cleanup;
 	}
 
-	rte_eal_mp_wait_lcore();
+	spdk_env_thread_wait_all();
 
 	rc = dump_result();
 

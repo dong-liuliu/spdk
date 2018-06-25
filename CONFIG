@@ -31,6 +31,9 @@
 #  OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #
 
+# Installation prefix
+CONFIG_PREFIX?=/usr/local
+
 # Build with debug logging. Turn off for performance testing and normal usage
 CONFIG_DEBUG?=n
 
@@ -52,6 +55,9 @@ CONFIG_UBSAN?=n
 # Build with Thread Sanitizer enabled
 CONFIG_TSAN?=n
 
+# Build tests
+CONFIG_TESTS?=y
+
 # Directory that contains the desired SPDK environment library.
 # By default, this is implemented using DPDK.
 CONFIG_ENV?=$(SPDK_ROOT_DIR)/lib/env_dpdk
@@ -60,7 +66,7 @@ CONFIG_ENV?=$(SPDK_ROOT_DIR)/lib/env_dpdk
 # installation. Alternatively you can specify this on the command line
 # with 'make DPDK_DIR=/path/to/dpdk'. This is only a valid entry
 # when using the default SPDK environment library.
-CONFIG_DPDK_DIR?=/path/to/dpdk
+CONFIG_DPDK_DIR?=$(SPDK_ROOT_DIR)/dpdk/build
 
 # Build SPDK FIO plugin. Requires FIO_SOURCE_DIR set to a valid
 # fio source code directory.
@@ -80,3 +86,15 @@ CONFIG_RBD?=n
 
 # Build vhost library.
 CONFIG_VHOST?=y
+
+# Build vhost initiator (Virtio) driver.
+CONFIG_VIRTIO?=y
+
+# Build with PMDK backends
+CONFIG_PMDK?=n
+
+# Build with VPP
+CONFIG_VPP?=n
+
+# Requires libiscsi development libraries.
+CONFIG_ISCSI_INITIATOR?=n

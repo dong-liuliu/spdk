@@ -15,6 +15,7 @@ The development kit currently includes:
 * [NVMe over Fabrics target](http://www.spdk.io/doc/nvmf.html)
 * [iSCSI target](http://www.spdk.io/doc/iscsi.html)
 * [vhost target](http://www.spdk.io/doc/vhost.html)
+* [Virtio-SCSI driver](http://www.spdk.io/doc/virtio.html)
 
 # In this readme:
 
@@ -36,43 +37,6 @@ The development kit currently includes:
 well as a [Porting Guide](http://www.spdk.io/doc/porting.html) for porting SPDK to different frameworks
 and operating systems.
 
-<a id="prerequisites"></a>
-## Prerequisites
-
-Note: The requirements for building the docs can take a while to
-install so you may want to skip them unless you need them.
-
-Fedora/CentOS:
-
-~~~{.sh}
-sudo dnf install -y gcc gcc-c++ make CUnit-devel libaio-devel openssl-devel \
-	git astyle-devel python-pep8 lcov python clang-analyzer
-# Additional dependencies for NVMe over Fabrics
-sudo dnf install -y libibverbs-devel librdmacm-devel
-# Additional dependencies for building docs
-sudo dnf install -y doxygen mscgen
-~~~
-
-Ubuntu/Debian:
-
-~~~{.sh}
-sudo apt-get install -y gcc g++ make libcunit1-dev libaio-dev libssl-dev \
-	git astyle pep8 lcov clang
-# Additional dependencies for NVMe over Fabrics
-sudo apt-get install -y libibverbs-dev librdmacm
-# Additional dependencies for building docs
-sudo apt-get install -y doxygen mscgen
-~~~
-
-FreeBSD:
-
-~~~{.sh}
-sudo pkg install gmake cunit openssl git devel/astyle bash devel/pep8 \
-	python
-# Additional dependencies for building docs
-sudo pkg install doxygen mscgen
-~~~
-
 <a id="source"></a>
 ## Source Code
 
@@ -80,6 +44,15 @@ sudo pkg install doxygen mscgen
 git clone https://github.com/spdk/spdk
 cd spdk
 git submodule update --init
+~~~
+
+<a id="prerequisites"></a>
+## Prerequisites
+
+The dependencies can be installed automatically by `scripts/pkgdep.sh`.
+
+~~~{.sh}
+./scripts/pkgdep.sh
 ~~~
 
 <a id="libraries"></a>
@@ -106,7 +79,7 @@ gmake
 ## Unit Tests
 
 ~~~{.sh}
-./unittest.sh
+./test/unit/unittest.sh
 ~~~
 
 You will see several error messages when running the unit tests, but they are
@@ -123,8 +96,8 @@ with the [VirtualBox](https://www.virtualbox.org/wiki/Downloads) provider.  The
 [VirtualBox Extension Pack](https://www.virtualbox.org/wiki/Downloads) must
 also be installed in order to get the required NVMe support.
 
-Details on the Vagrant setup can be found in
-[scripts/vagrant/README.md](scripts/vagrant/README.md).
+Details on the Vagrant setup can be found in the
+[SPDK Vagrant documentation](http://spdk.io/doc/vagrant.html).
 
 <a id="advanced"></a>
 ## Advanced Build Options
@@ -192,6 +165,13 @@ This script should be run as root.
 
 ~~~{.sh}
 sudo scripts/setup.sh
+~~~
+
+Users may wish to configure a specific memory size. Below is an example of
+configuring 8192MB memory.
+
+~~~{.sh}
+sudo HUGEMEM=8192 scripts/setup.sh
 ~~~
 
 <a id="examples"></a>

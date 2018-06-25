@@ -48,12 +48,12 @@ spdk_iscsi_find_tgt_node(const char *target_name)
 	return NULL;
 }
 
-int
+bool
 spdk_iscsi_tgt_node_access(struct spdk_iscsi_conn *conn,
 			   struct spdk_iscsi_tgt_node *target,
 			   const char *iqn, const char *addr)
 {
-	return 0;
+	return false;
 }
 
 int
@@ -89,7 +89,7 @@ burst_length_param_negotation(int FirstBurstLength, int MaxBurstLength,
 	sess.session_type = SESSION_TYPE_NORMAL;
 	sess.params = NULL;
 	sess.MaxBurstLength = 65536;
-	sess.InitialR2T = 1;
+	sess.InitialR2T = true;
 	sess.FirstBurstLength = SPDK_ISCSI_FIRST_BURST_LENGTH;
 	sess.MaxOutstandingR2T = 1;
 
@@ -240,7 +240,7 @@ parse_valid_test(void)
 	data = malloc(len);
 	SPDK_CU_ASSERT_FATAL(data != NULL);
 	memset(data, 'A', len);
-	strcpy(data, "CHAP_C");
+	memcpy(data, "CHAP_C", 6);
 	data[6] = '=';
 	data[len - 1] = '\0';
 	rc = spdk_iscsi_parse_params(&params, data, len, false, NULL);
@@ -315,7 +315,7 @@ parse_invalid_test(void)
 	data = malloc(len);
 	SPDK_CU_ASSERT_FATAL(data != NULL);
 	memset(data, 'A', len);
-	strcpy(data, "CHAP_C");
+	memcpy(data, "CHAP_C", 6);
 	data[6] = '=';
 	data[len - 1] = '\0';
 	rc = spdk_iscsi_parse_params(&params, data, len, false, NULL);

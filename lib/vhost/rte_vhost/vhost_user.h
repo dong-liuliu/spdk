@@ -43,17 +43,24 @@
 
 #define VHOST_MEMORY_MAX_NREGIONS 8
 
+/*
+ * Maximum size of virtio device config space
+ */
+#define VHOST_USER_MAX_CONFIG_SIZE 256
+
 #define VHOST_USER_PROTOCOL_F_MQ	0
 #define VHOST_USER_PROTOCOL_F_LOG_SHMFD	1
 #define VHOST_USER_PROTOCOL_F_RARP	2
 #define VHOST_USER_PROTOCOL_F_REPLY_ACK	3
 #define VHOST_USER_PROTOCOL_F_NET_MTU 4
+#define VHOST_USER_PROTOCOL_F_CONFIG 9
 
 #define VHOST_USER_PROTOCOL_FEATURES	((1ULL << VHOST_USER_PROTOCOL_F_MQ) | \
 					 (1ULL << VHOST_USER_PROTOCOL_F_LOG_SHMFD) |\
 					 (1ULL << VHOST_USER_PROTOCOL_F_RARP) | \
 					 (1ULL << VHOST_USER_PROTOCOL_F_REPLY_ACK) | \
-					 (1ULL << VHOST_USER_PROTOCOL_F_NET_MTU))
+					 (1ULL << VHOST_USER_PROTOCOL_F_NET_MTU) | \
+					 (1ULL << VHOST_USER_PROTOCOL_F_CONFIG))
 
 typedef enum VhostUserRequest {
 	VHOST_USER_NONE = 0,
@@ -77,8 +84,22 @@ typedef enum VhostUserRequest {
 	VHOST_USER_SET_VRING_ENABLE = 18,
 	VHOST_USER_SEND_RARP = 19,
 	VHOST_USER_NET_SET_MTU = 20,
+	VHOST_USER_GET_CONFIG = 24,
+	VHOST_USER_SET_CONFIG = 25,
+	VHOST_USER_NVME_ADMIN = 80,
+	VHOST_USER_NVME_SET_CQ_CALL = 81,
+	VHOST_USER_NVME_GET_CAP = 82,
+	VHOST_USER_NVME_START_STOP = 83,
+	VHOST_USER_NVME_IO_CMD = 84,
 	VHOST_USER_MAX
 } VhostUserRequest;
+
+typedef enum VhostUserSlaveRequest {
+	VHOST_USER_SLAVE_NONE = 0,
+	VHOST_USER_SLAVE_IOTLB_MSG = 1,
+	VHOST_USER_SLAVE_CONFIG_CHANGE_MSG = 2,
+	VHOST_USER_SLAVE_MAX
+} VhostUserSlaveRequest;
 
 typedef struct VhostUserMemoryRegion {
 	uint64_t guest_phys_addr;
@@ -98,6 +119,24 @@ typedef struct VhostUserLog {
 	uint64_t mmap_offset;
 } VhostUserLog;
 
+typedef struct VhostUserConfig {
+	uint32_t offset;
+	uint32_t size;
+	uint32_t flags;
+	uint8_t region[VHOST_USER_MAX_CONFIG_SIZE];
+} VhostUserConfig;
+
+enum VhostUserNvmeQueueTypes {
+	VHOST_USER_NVME_SUBMISSION_QUEUE = 1,
+	VHOST_USER_NVME_COMPLETION_QUEUE = 2,
+};
+
+typedef struct VhostUserNvmeIO {
+	enum VhostUserNvmeQueueTypes queue_type;
+	uint32_t qid;
+	uint32_t tail_head;
+} VhostUserNvmeIO;
+
 typedef struct VhostUserMsg {
 	VhostUserRequest request;
 
@@ -114,6 +153,15 @@ typedef struct VhostUserMsg {
 		struct vhost_vring_addr addr;
 		VhostUserMemory memory;
 		VhostUserLog    log;
+		VhostUserConfig config;
+		struct nvme {
+			union {
+				uint8_t req[64];
+				uint8_t cqe[16];
+			} cmd;
+			uint8_t buf[4096];
+		} nvme;
+		struct VhostUserNvmeIO nvme_io;
 	} payload;
 	int fds[VHOST_MEMORY_MAX_NREGIONS];
 } __attribute((packed)) VhostUserMsg;

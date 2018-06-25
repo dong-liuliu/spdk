@@ -3,15 +3,13 @@
 NVMF_PORT=4420
 NVMF_IP_PREFIX="192.168.100"
 NVMF_IP_LEAST_ADDR=8
-NVMF_FIRST_TARGET_IP=$NVMF_IP_PREFIX.$NVMF_IP_LEAST_ADDR
-RPC_PORT=5260
 
 if [ -z "$NVMF_APP" ]; then
 	NVMF_APP=./app/nvmf_tgt/nvmf_tgt
 fi
 
 if [ -z "$NVMF_TEST_CORE_MASK" ]; then
-	NVMF_TEST_CORE_MASK=0xFFFF
+	NVMF_TEST_CORE_MASK=0xFF
 fi
 
 function load_ib_rdma_modules()
@@ -28,6 +26,23 @@ function load_ib_rdma_modules()
 	modprobe iw_cm
 	modprobe rdma_cm
 	modprobe rdma_ucm
+}
+
+
+function detect_soft_roce_nics()
+{
+	if hash rxe_cfg; then
+		rxe_cfg start
+		rdma_nics=$(get_rdma_if_list)
+		all_nics=$(ip -o link | awk '{print $2}' | cut -d":" -f1)
+		non_rdma_nics=$(echo -e "$rdma_nics\n$all_nics" | sort | uniq -u)
+		for nic in $non_rdma_nics; do
+			if [[ -d /sys/class/net/${nic}/bridge ]]; then
+				continue
+			fi
+			rxe_cfg add $nic || true
+		done
+	fi
 }
 
 function detect_mellanox_nics()
@@ -64,28 +79,51 @@ function detect_mellanox_nics()
 	fi
 
 	# The mlx4 driver takes an extra few seconds to load after modprobe returns,
-	# otherwise ifconfig operations will do nothing.
+	# otherwise iproute2 operations will do nothing.
 	sleep 5
 }
 
 function detect_rdma_nics()
 {
-	# could be add other nics, so wrap it
 	detect_mellanox_nics
+	detect_soft_roce_nics
 }
 
 function allocate_nic_ips()
 {
 	let count=$NVMF_IP_LEAST_ADDR
+	for nic_name in $(get_rdma_if_list); do
+		ip="$(get_ip_address $nic_name)"
+		if [ -z $ip ]; then
+			ip addr add $NVMF_IP_PREFIX.$count/24 dev $nic_name
+			ip link set $nic_name up
+			let count=$count+1
+		fi
+		# dump configuration for debug log
+		ip addr show $nic_name
+	done
+}
+
+function get_available_rdma_ips()
+{
+	for nic_name in $(get_rdma_if_list); do
+		get_ip_address $nic_name
+	done
+}
+
+function get_rdma_if_list()
+{
 	for nic_type in `ls /sys/class/infiniband`; do
 		for nic_name in `ls /sys/class/infiniband/${nic_type}/device/net`; do
-			ifconfig $nic_name $NVMF_IP_PREFIX.$count netmask 255.255.255.0 up
-
-			# dump configuration for debug log
-			ifconfig $nic_name
-			let count=$count+1
+			echo "$nic_name"
 		done
 	done
+}
+
+function get_ip_address()
+{
+	interface=$1
+	ip -o -4 addr show $interface | awk '{print $4}' | cut -d"/" -f1
 }
 
 function nvmfcleanup()
@@ -101,7 +139,28 @@ function rdma_device_init()
 	allocate_nic_ips
 }
 
-function rdma_nic_available()
+function revert_soft_roce()
 {
-	ifconfig | grep -q $NVMF_IP_PREFIX
+	if hash rxe_cfg; then
+		interfaces="$(ip -o link | awk '{print $2}' | cut -d":" -f1)"
+		for interface in $interfaces; do
+			rxe_cfg remove $interface || true
+		done
+		rxe_cfg stop || true
+	fi
+}
+
+function check_ip_is_soft_roce()
+{
+	IP=$1
+	if hash rxe_cfg; then
+		dev=$(ip -4 -o addr show | grep $IP | cut -d" " -f2)
+		if rxe_cfg | grep $dev; then
+			return 0
+		else
+			return 1
+		fi
+	else
+		return 1
+	fi
 }

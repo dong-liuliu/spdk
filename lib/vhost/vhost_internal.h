@@ -40,6 +40,7 @@
 
 #include "spdk_internal/log.h"
 #include "spdk/event.h"
+#include "spdk/rpc.h"
 
 #define SPDK_CACHE_LINE_SIZE RTE_CACHE_LINE_SIZE
 
@@ -51,17 +52,85 @@
 #define VIRTIO_F_VERSION_1 32
 #endif
 
+#ifndef VIRTIO_BLK_F_MQ
+#define VIRTIO_BLK_F_MQ		12	/* support more than one vq */
+#endif
+
 #ifndef VIRTIO_BLK_F_CONFIG_WCE
 #define VIRTIO_BLK_F_CONFIG_WCE	11
 #endif
 
-#define MAX_VHOST_VRINGS	256
+#define SPDK_VHOST_MAX_VQUEUES	256
+#define SPDK_VHOST_MAX_VQ_SIZE	1024
 
 #define SPDK_VHOST_SCSI_CTRLR_MAX_DEVS 8
 
-enum spdk_vhost_dev_type {
-	SPDK_VHOST_DEV_T_SCSI,
-	SPDK_VHOST_DEV_T_BLK,
+#define SPDK_VHOST_IOVS_MAX 129
+
+/*
+ * Rate at which stats are checked for interrupt coalescing.
+ */
+#define SPDK_VHOST_DEV_STATS_CHECK_INTERVAL_MS 10
+/*
+ * Default threshold at which interrupts start to be coalesced.
+ */
+#define SPDK_VHOST_VQ_IOPS_COALESCING_THRESHOLD 60000
+
+/*
+ * Currently coalescing is not used by default.
+ * Setting this to value > 0 here or by RPC will enable coalescing.
+ */
+#define SPDK_VHOST_COALESCING_DELAY_BASE_US 0
+
+
+#define SPDK_VHOST_FEATURES ((1ULL << VHOST_F_LOG_ALL) | \
+	(1ULL << VHOST_USER_F_PROTOCOL_FEATURES) | \
+	(1ULL << VIRTIO_F_VERSION_1) | \
+	(1ULL << VIRTIO_F_NOTIFY_ON_EMPTY) | \
+	(1ULL << VIRTIO_RING_F_EVENT_IDX) | \
+	(1ULL << VIRTIO_RING_F_INDIRECT_DESC))
+
+#define SPDK_VHOST_DISABLED_FEATURES ((1ULL << VIRTIO_RING_F_EVENT_IDX) | \
+	(1ULL << VIRTIO_F_NOTIFY_ON_EMPTY))
+
+struct spdk_vhost_virtqueue {
+	struct rte_vhost_vring vring;
+	void *tasks;
+
+	/* Request count from last stats check */
+	uint32_t req_cnt;
+
+	/* Request count from last event */
+	uint16_t used_req_cnt;
+
+	/* How long interrupt is delayed */
+	uint32_t irq_delay_time;
+
+	/* Next time when we need to send event */
+	uint64_t next_event_time;
+
+} __attribute((aligned(SPDK_CACHE_LINE_SIZE)));
+
+struct spdk_vhost_dev_backend {
+	uint64_t virtio_features;
+	uint64_t disabled_features;
+
+	/**
+	 * Callbacks for starting and pausing the device.
+	 * The first param is struct spdk_vhost_dev *.
+	 * The second one is event context that has to be
+	 * passed to spdk_vhost_dev_backend_event_done().
+	 */
+	spdk_vhost_event_fn start_device;
+	spdk_vhost_event_fn stop_device;
+
+	int (*vhost_get_config)(struct spdk_vhost_dev *vdev, uint8_t *config, uint32_t len);
+	int (*vhost_set_config)(struct spdk_vhost_dev *vdev, uint8_t *config,
+				uint32_t offset, uint32_t size, uint32_t flags);
+
+	void (*dump_info_json)(struct spdk_vhost_dev *vdev, struct spdk_json_write_ctx *w);
+	void (*write_config_json)(struct spdk_vhost_dev *vdev, struct spdk_json_write_ctx *w);
+	int (*remove_device)(struct spdk_vhost_dev *vdev);
 };
 
 struct spdk_vhost_dev {
@@ -69,78 +138,135 @@ struct spdk_vhost_dev {
 	char *name;
 	char *path;
 
+	/* Unique device ID. */
+	unsigned id;
+
+	/* rte_vhost device ID. */
 	int vid;
 	int task_cnt;
 	int32_t lcore;
-	uint64_t cpumask;
+	struct spdk_cpuset *cpumask;
+	bool registered;
 
-	enum spdk_vhost_dev_type type;
+	const struct spdk_vhost_dev_backend *backend;
 
-	uint16_t num_queues;
+	/* Saved orginal values used to setup coalescing to avoid integer
+	 * rounding issues during save/load config.
+	 */
+	uint32_t coalescing_delay_us;
+	uint32_t coalescing_iops_threshold;
+
+	uint32_t coalescing_delay_time_base;
+
+	/* Threshold when event coalescing for virtqueue will be turned on. */
+	uint32_t  coalescing_io_rate_threshold;
+
+	/* Next time when stats for event coalescing will be checked. */
+	uint64_t next_stats_check_time;
+
+	/* Interval used for event coalescing checking. */
+	uint64_t stats_check_interval;
+
+	uint16_t max_queues;
+
 	uint64_t negotiated_features;
-	struct rte_vhost_vring virtqueue[MAX_VHOST_VRINGS] __attribute((aligned(SPDK_CACHE_LINE_SIZE)));
+
+	struct spdk_vhost_virtqueue virtqueue[SPDK_VHOST_MAX_VQUEUES];
+
+	TAILQ_ENTRY(spdk_vhost_dev) tailq;
 };
 
+struct spdk_vhost_dev *spdk_vhost_dev_find(const char *ctrlr_name);
 
-struct spdk_vhost_dev_backend {
-	uint64_t virtio_features;
-	uint64_t disabled_features;
-	const struct vhost_device_ops ops;
-};
+void *spdk_vhost_gpa_to_vva(struct spdk_vhost_dev *vdev, uint64_t addr, uint64_t len);
 
-void spdk_vhost_dev_mem_register(struct spdk_vhost_dev *vdev);
-void spdk_vhost_dev_mem_unregister(struct spdk_vhost_dev *vdev);
-
-void *spdk_vhost_gpa_to_vva(struct spdk_vhost_dev *vdev, uint64_t addr);
-
-uint16_t spdk_vhost_vq_avail_ring_get(struct rte_vhost_vring *vq, uint16_t *reqs,
+uint16_t spdk_vhost_vq_avail_ring_get(struct spdk_vhost_virtqueue *vq, uint16_t *reqs,
 				      uint16_t reqs_len);
-bool spdk_vhost_vq_should_notify(struct spdk_vhost_dev *vdev, struct rte_vhost_vring *vq);
 
-struct vring_desc *spdk_vhost_vq_get_desc(struct rte_vhost_vring *vq, uint16_t req_idx);
+/**
+ * Get a virtio descriptor at given index in given virtqueue.
+ * The descriptor will provide access to the entire descriptor
+ * chain. The subsequent descriptors are accesible via
+ * \c spdk_vhost_vring_desc_get_next.
+ * \param vdev vhost device
+ * \param vq virtqueue
+ * \param req_idx descriptor index
+ * \param desc pointer to be set to the descriptor
+ * \param desc_table descriptor table to be used with
+ * \c spdk_vhost_vring_desc_get_next. This might be either
+ * default virtqueue descriptor table or per-chain indirect
+ * table.
+ * \param desc_table_size size of the *desc_table*
+ * \return 0 on success, -1 if given index is invalid.
+ * If -1 is returned, the content of params is undefined.
+ */
+int spdk_vhost_vq_get_desc(struct spdk_vhost_dev *vdev, struct spdk_vhost_virtqueue *vq,
+			   uint16_t req_idx, struct vring_desc **desc, struct vring_desc **desc_table,
+			   uint32_t *desc_table_size);
 
-void spdk_vhost_vq_used_ring_enqueue(struct spdk_vhost_dev *vdev, struct rte_vhost_vring *vq,
+/**
+ * Send IRQ/call client (if pending) for \c vq.
+ * \param vdev vhost device
+ * \param vq virtqueue
+ * \return
+ *   0 - if no interrupt was signalled
+ *   1 - if interrupt was signalled
+ */
+int spdk_vhost_vq_used_signal(struct spdk_vhost_dev *vdev, struct spdk_vhost_virtqueue *vq);
+
+
+/**
+ * Send IRQs for all queues that need to be signaled.
+ * \param vdev vhost device
+ * \param vq virtqueue
+ */
+void spdk_vhost_dev_used_signal(struct spdk_vhost_dev *vdev);
+
+void spdk_vhost_vq_used_ring_enqueue(struct spdk_vhost_dev *vdev, struct spdk_vhost_virtqueue *vq,
 				     uint16_t id, uint32_t len);
-bool spdk_vhost_vring_desc_has_next(struct vring_desc *cur_desc);
-struct vring_desc *spdk_vhost_vring_desc_get_next(struct vring_desc *vq_desc,
-		struct vring_desc *cur_desc);
+
+/**
+ * Get subsequent descriptor from given table.
+ * \param desc current descriptor, will be set to the
+ * next descriptor (NULL in case this is the last
+ * descriptor in the chain or the next desc is invalid)
+ * \param desc_table descriptor table
+ * \param desc_table_size size of the *desc_table*
+ * \return 0 on success, -1 if given index is invalid
+ * The *desc* param will be set regardless of the
+ * return value.
+ */
+int spdk_vhost_vring_desc_get_next(struct vring_desc **desc,
+				   struct vring_desc *desc_table, uint32_t desc_table_size);
 bool spdk_vhost_vring_desc_is_wr(struct vring_desc *cur_desc);
 
-bool spdk_vhost_vring_desc_to_iov(struct spdk_vhost_dev *vdev, struct iovec *iov,
-				  const struct vring_desc *desc);
+int spdk_vhost_vring_desc_to_iov(struct spdk_vhost_dev *vdev, struct iovec *iov,
+				 uint16_t *iov_index, const struct vring_desc *desc);
 
-struct spdk_vhost_dev *spdk_vhost_dev_find_by_vid(int vid);
+static inline bool __attribute__((always_inline))
+spdk_vhost_dev_has_feature(struct spdk_vhost_dev *vdev, unsigned feature_id)
+{
+	return vdev->negotiated_features & (1ULL << feature_id);
+}
 
-int spdk_vhost_dev_construct(struct spdk_vhost_dev *vdev, const char *name, uint64_t cpumask,
-			     enum spdk_vhost_dev_type type, const struct spdk_vhost_dev_backend *backend);
-int spdk_vhost_dev_remove(struct spdk_vhost_dev *vdev);
+int spdk_vhost_dev_register(struct spdk_vhost_dev *vdev, const char *name, const char *mask_str,
+			    const struct spdk_vhost_dev_backend *backend);
+int spdk_vhost_dev_unregister(struct spdk_vhost_dev *vdev);
 
-struct spdk_vhost_dev *spdk_vhost_dev_load(int vid);
-void spdk_vhost_dev_unload(struct spdk_vhost_dev *dev);
-
-typedef void (*spdk_vhost_timed_event_fn)(void *);
-
-struct spdk_vhost_timed_event {
-	/** User callback function to be executed on given lcore. */
-	spdk_vhost_timed_event_fn cb_fn;
-
-	/** Semaphore used to signal that event is done. */
-	sem_t sem;
-
-	/** Timout specified during initialization. */
-	struct timespec timeout;
-
-	/** Event object that can be passed to *spdk_event_call()*. */
-	struct spdk_event *spdk_event;
-};
-
-void spdk_vhost_timed_event_init(struct spdk_vhost_timed_event *ev, int32_t lcore,
-				 spdk_vhost_timed_event_fn cb_fn, void *arg, unsigned timeout_sec);
-
-void spdk_vhost_timed_event_send(int32_t lcore, spdk_vhost_timed_event_fn cn_fn, void *arg,
-				 unsigned timeout_sec, const char *errmsg);
-void spdk_vhost_timed_event_wait(struct spdk_vhost_timed_event *event, const char *errmsg);
-
+int spdk_vhost_scsi_controller_construct(void);
 int spdk_vhost_blk_controller_construct(void);
+void spdk_vhost_dump_info_json(struct spdk_vhost_dev *vdev, struct spdk_json_write_ctx *w);
+void spdk_vhost_dev_backend_event_done(void *event_ctx, int response);
+void spdk_vhost_lock(void);
+void spdk_vhost_unlock(void);
+int spdk_remove_vhost_controller(struct spdk_vhost_dev *vdev);
+int spdk_vhost_nvme_admin_passthrough(int vid, void *cmd, void *cqe, void *buf);
+int spdk_vhost_nvme_set_cq_call(int vid, uint16_t qid, int fd);
+int spdk_vhost_nvme_get_cap(int vid, uint64_t *cap);
+int spdk_vhost_nvme_controller_construct(void);
+int spdk_vhost_nvme_dev_construct(const char *name, const char *cpumask, uint32_t io_queues);
+int spdk_vhost_nvme_dev_remove(struct spdk_vhost_dev *vdev);
+int spdk_vhost_nvme_dev_add_ns(struct spdk_vhost_dev *vdev,
+			       const char *bdev_name);
 
 #endif /* SPDK_VHOST_INTERNAL_H */

@@ -36,7 +36,8 @@
 #include "spdk_cunit.h"
 #include "spdk/log.h"
 
-#include "log.c"
+#include "log/log.c"
+#include "log/log_flags.c"
 
 static void
 log_test(void)
@@ -53,21 +54,21 @@ log_test(void)
 	CU_ASSERT_EQUAL(spdk_log_get_level(), SPDK_LOG_DEBUG);
 
 #ifdef DEBUG
-	CU_ASSERT(spdk_log_get_trace_flag("debug") == false);
+	CU_ASSERT(spdk_log_get_trace_flag("log") == false);
 
-	spdk_log_set_trace_flag("debug");
-	CU_ASSERT(spdk_log_get_trace_flag("debug") == true);
+	spdk_log_set_trace_flag("log");
+	CU_ASSERT(spdk_log_get_trace_flag("log") == true);
 
-	spdk_log_clear_trace_flag("debug");
-	CU_ASSERT(spdk_log_get_trace_flag("debug") == false);
+	spdk_log_clear_trace_flag("log");
+	CU_ASSERT(spdk_log_get_trace_flag("log") == false);
 #endif
 
 	spdk_log_open();
-	spdk_log_set_trace_flag("debug");
+	spdk_log_set_trace_flag("log");
 	SPDK_WARNLOG("log warning unit test\n");
-	SPDK_TRACELOG(SPDK_TRACE_DEBUG, "log trace test\n");
-	SPDK_TRACEDUMP(SPDK_TRACE_DEBUG, "log trace dump test:", "trace dump", 10);
-	spdk_trace_dump("spdk dump test:", "spdk dump", 9);
+	SPDK_DEBUGLOG(SPDK_LOG_LOG, "log trace test\n");
+	SPDK_TRACEDUMP(SPDK_LOG_LOG, "log trace dump test:", "trace dump", 10);
+	spdk_trace_dump(stderr, "spdk dump test:", "spdk dump", 9);
 
 	spdk_log_close();
 }

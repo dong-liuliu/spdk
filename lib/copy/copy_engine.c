@@ -36,8 +36,9 @@
 #include "spdk_internal/copy_engine.h"
 
 #include "spdk/env.h"
+#include "spdk/event.h"
 #include "spdk/log.h"
-#include "spdk/io_channel.h"
+#include "spdk/thread.h"
 
 static size_t g_max_copy_module_size = 0;
 
@@ -52,6 +53,10 @@ struct copy_io_channel {
 	struct spdk_copy_engine	*engine;
 	struct spdk_io_channel	*ch;
 };
+
+struct spdk_copy_module_if *g_copy_engine_module = NULL;
+spdk_copy_fini_cb g_fini_cb_fn = NULL;
+void *g_fini_cb_arg = NULL;
 
 void
 spdk_copy_engine_register(struct spdk_copy_engine *copy_engine)
@@ -75,7 +80,7 @@ copy_engine_done(void *ref, int status)
 	req->cb(req, status);
 }
 
-int64_t
+int
 spdk_copy_submit(struct spdk_copy_task *copy_req, struct spdk_io_channel *ch,
 		 void *dst, void *src, uint64_t nbytes, spdk_copy_completion_cb cb)
 {
@@ -87,7 +92,7 @@ spdk_copy_submit(struct spdk_copy_task *copy_req, struct spdk_io_channel *ch,
 				     copy_engine_done);
 }
 
-int64_t
+int
 spdk_copy_submit_fill(struct spdk_copy_task *copy_req, struct spdk_io_channel *ch,
 		      void *dst, uint8_t fill, uint64_t nbytes, spdk_copy_completion_cb cb)
 {
@@ -100,7 +105,7 @@ spdk_copy_submit_fill(struct spdk_copy_task *copy_req, struct spdk_io_channel *c
 }
 
 /* memcpy default copy engine */
-static int64_t
+static int
 mem_copy_submit(void *cb_arg, struct spdk_io_channel *ch, void *dst, void *src, uint64_t nbytes,
 		spdk_copy_completion_cb cb)
 {
@@ -111,10 +116,10 @@ mem_copy_submit(void *cb_arg, struct spdk_io_channel *ch, void *dst, void *src, 
 	copy_req = (struct spdk_copy_task *)((uintptr_t)cb_arg -
 					     offsetof(struct spdk_copy_task, offload_ctx));
 	cb(copy_req, 0);
-	return nbytes;
+	return 0;
 }
 
-static int64_t
+static int
 mem_copy_fill(void *cb_arg, struct spdk_io_channel *ch, void *dst, uint8_t fill, uint64_t nbytes,
 	      spdk_copy_completion_cb cb)
 {
@@ -125,7 +130,7 @@ mem_copy_fill(void *cb_arg, struct spdk_io_channel *ch, void *dst, uint8_t fill,
 					     offsetof(struct spdk_copy_task, offload_ctx));
 	cb(copy_req, 0);
 
-	return nbytes;
+	return 0;
 }
 
 static struct spdk_io_channel *mem_get_io_channel(void);
@@ -224,17 +229,6 @@ spdk_copy_engine_module_initialize(void)
 	}
 }
 
-static void
-spdk_copy_engine_module_finish(void)
-{
-	struct spdk_copy_module_if *copy_engine_module;
-
-	TAILQ_FOREACH(copy_engine_module, &spdk_copy_module_list, tailq) {
-		if (copy_engine_module->module_fini)
-			copy_engine_module->module_fini();
-	}
-}
-
 int
 spdk_copy_engine_initialize(void)
 {
@@ -249,11 +243,58 @@ spdk_copy_engine_initialize(void)
 	return 0;
 }
 
-int
-spdk_copy_engine_finish(void)
+static void
+spdk_copy_engine_module_finish_cb(void)
 {
+	spdk_copy_fini_cb cb_fn = g_fini_cb_fn;
+
+	cb_fn(g_fini_cb_arg);
+	g_fini_cb_fn = NULL;
+	g_fini_cb_arg = NULL;
+}
+
+void
+spdk_copy_engine_module_finish(void)
+{
+	if (!g_copy_engine_module) {
+		g_copy_engine_module = TAILQ_FIRST(&spdk_copy_module_list);
+	} else {
+		g_copy_engine_module = TAILQ_NEXT(g_copy_engine_module, tailq);
+	}
+
+	if (!g_copy_engine_module) {
+		spdk_copy_engine_module_finish_cb();
+		return;
+	}
+
+	if (g_copy_engine_module->module_fini) {
+		spdk_thread_send_msg(spdk_get_thread(), g_copy_engine_module->module_fini, NULL);
+	} else {
+		spdk_copy_engine_module_finish();
+	}
+}
+
+void
+spdk_copy_engine_finish(spdk_copy_fini_cb cb_fn, void *cb_arg)
+{
+	assert(cb_fn != NULL);
+
+	g_fini_cb_fn = cb_fn;
+	g_fini_cb_arg = cb_arg;
+
 	spdk_copy_engine_module_finish();
-	return 0;
+}
+
+void
+spdk_copy_engine_config_text(FILE *fp)
+{
+	struct spdk_copy_module_if *copy_engine_module;
+
+	TAILQ_FOREACH(copy_engine_module, &spdk_copy_module_list, tailq) {
+		if (copy_engine_module->config_text) {
+			copy_engine_module->config_text(fp);
+		}
+	}
 }
 
 SPDK_COPY_MODULE_REGISTER(copy_engine_mem_init, NULL, NULL, copy_engine_mem_get_ctx_size)

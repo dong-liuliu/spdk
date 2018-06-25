@@ -38,15 +38,16 @@
  * TODO: move bdev SCSI error code translation tests to bdev unit test
  * and remove this include.
  */
-#include "spdk_internal/bdev.h"
+#include "spdk/bdev_module.h"
 
 #include "spdk/env.h"
 #include "spdk/bdev.h"
 #include "spdk/endian.h"
+#include "spdk/likely.h"
 #include "spdk/string.h"
 #include "spdk/util.h"
 
-#define SPDK_WORK_BLOCK_SIZE		(1ULL * 1024ULL * 1024ULL)
+#define SPDK_WORK_BLOCK_SIZE		(4ULL * 1024ULL * 1024ULL)
 #define SPDK_WORK_ATS_BLOCK_SIZE	(1ULL * 1024ULL * 1024ULL)
 #define MAX_SERIAL_STRING		32
 
@@ -54,6 +55,7 @@
 #define DEFAULT_DISK_REVISION		"0001"
 #define DEFAULT_DISK_ROTATION_RATE	1	/* Non-rotating medium */
 #define DEFAULT_DISK_FORM_FACTOR	0x02	/* 3.5 inch */
+#define DEFAULT_MAX_UNMAP_BLOCK_DESCRIPTOR_COUNT	256
 
 #define INQUIRY_OFFSET(field)		offsetof(struct spdk_scsi_cdb_inquiry_data, field) + \
 					sizeof(((struct spdk_scsi_cdb_inquiry_data *)0x0)->field)
@@ -61,11 +63,13 @@
 static int
 spdk_hex2bin(char ch)
 {
-	if ((ch >= '0') && (ch <= '9'))
+	if ((ch >= '0') && (ch <= '9')) {
 		return ch - '0';
+	}
 	ch = tolower(ch);
-	if ((ch >= 'a') && (ch <= 'f'))
+	if ((ch >= 'a') && (ch <= 'f')) {
 		return ch - 'a' + 10;
+	}
 	return (int)ch;
 }
 
@@ -105,8 +109,9 @@ spdk_bdev_scsi_report_luns(struct spdk_scsi_lun *lun,
 	int hlen, len = 0;
 	int i;
 
-	if (alloc_len < 8)
+	if (alloc_len < 8) {
 		return -1;
+	}
 
 	if (sel == 0x00) {
 		/* logical unit with addressing method */
@@ -114,8 +119,9 @@ spdk_bdev_scsi_report_luns(struct spdk_scsi_lun *lun,
 		/* well known logical unit */
 	} else if (sel == 0x02) {
 		/* logical unit */
-	} else
+	} else {
 		return -1;
+	}
 
 	/* LUN LIST LENGTH */
 	memset(data, 0, 4);
@@ -125,21 +131,24 @@ spdk_bdev_scsi_report_luns(struct spdk_scsi_lun *lun,
 	hlen = 8;
 
 	dev = lun->dev;
-	for (i = 0; i < dev->maxlun; i++) {
-		if (dev->lun[i] == NULL)
-			continue;
 
-		if (alloc_len - (hlen + len) < 8)
+	for (i = 0; i < SPDK_SCSI_DEV_MAX_LUN; i++) {
+		if (dev->lun[i] == NULL) {
+			continue;
+		}
+
+		if (alloc_len - (hlen + len) < 8) {
 			return -1;
+		}
 
 		lun_id = (uint64_t)i;
 
-		if (dev->maxlun <= 0x0100) {
+		if (SPDK_SCSI_DEV_MAX_LUN <= 0x0100) {
 			/* below 256 */
 			method = 0x00U;
 			fmt_lun = (method & 0x03U) << 62;
 			fmt_lun |= (lun_id & 0x00ffU) << 48;
-		} else if (dev->maxlun <= 0x4000) {
+		} else if (SPDK_SCSI_DEV_MAX_LUN <= 0x4000) {
 			/* below 16384 */
 			method = 0x01U;
 			fmt_lun = (method & 0x03U) << 62;
@@ -161,6 +170,20 @@ spdk_bdev_scsi_report_luns(struct spdk_scsi_lun *lun,
 }
 
 static int
+spdk_bdev_scsi_pad_scsi_name(char *dst, const char *name)
+{
+	size_t len;
+
+	len = strlen(name);
+	memcpy(dst, name, len);
+	do {
+		dst[len++] = '\0';
+	} while (len & 3);
+
+	return len;
+}
+
+static int
 spdk_bdev_scsi_inquiry(struct spdk_bdev *bdev, struct spdk_scsi_task *task,
 		       uint8_t *cdb, uint8_t *data, uint16_t alloc_len)
 {
@@ -177,8 +200,9 @@ spdk_bdev_scsi_inquiry(struct spdk_bdev *bdev, struct spdk_scsi_task *task,
 	struct spdk_scsi_cdb_inquiry *inq = (struct spdk_scsi_cdb_inquiry *)cdb;
 
 	/* standard inquiry command at lease with 36 Bytes */
-	if (alloc_len < 0x24)
+	if (alloc_len < 0x24) {
 		goto inq_error;
+	}
 
 	lun = task->lun;
 	dev = lun->dev;
@@ -200,7 +224,8 @@ spdk_bdev_scsi_inquiry(struct spdk_bdev *bdev, struct spdk_scsi_task *task,
 		struct spdk_scsi_vpd_page *vpage = (struct spdk_scsi_vpd_page *)data;
 
 		/* PERIPHERAL QUALIFIER(7-5) PERIPHERAL DEVICE TYPE(4-0) */
-		vpage->peripheral = pd;
+		vpage->peripheral_device_type = pd;
+		vpage->peripheral_qualifier = SPDK_SPC_PERIPHERAL_QUALIFIER_CONNECTED;
 		/* PAGE CODE */
 		vpage->page_code = pc;
 
@@ -216,14 +241,11 @@ spdk_bdev_scsi_inquiry(struct spdk_bdev *bdev, struct spdk_scsi_task *task,
 			vpage->params[4] = SPDK_SPC_VPD_EXTENDED_INQUIRY_DATA;
 			vpage->params[5] = SPDK_SPC_VPD_MODE_PAGE_POLICY;
 			vpage->params[6] = SPDK_SPC_VPD_SCSI_PORTS;
-			/* SBC Block Limits */
-			vpage->params[7] = 0xb0;
-			/* SBC Block Device Characteristics */
-			vpage->params[8] = 0xb1;
+			vpage->params[7] = SPDK_SPC_VPD_BLOCK_LIMITS;
+			vpage->params[8] = SPDK_SPC_VPD_BLOCK_DEV_CHARS;
 			len = 9;
 			if (spdk_bdev_io_type_supported(bdev, SPDK_BDEV_IO_TYPE_UNMAP)) {
-				/* SBC Thin Provisioning */
-				vpage->params[9] = 0xb2;
+				vpage->params[9] = SPDK_SPC_VPD_BLOCK_THIN_PROVISION;
 				len++;
 			}
 
@@ -262,7 +284,7 @@ spdk_bdev_scsi_inquiry(struct spdk_bdev *bdev, struct spdk_scsi_task *task,
 			/* Check total length by calculated how much space all entries take */
 			len = sizeof(struct spdk_scsi_desig_desc) + 8;
 			len += sizeof(struct spdk_scsi_desig_desc) + 8 + 16 + MAX_SERIAL_STRING;
-			len += sizeof(struct spdk_scsi_desig_desc) + SPDK_SCSI_DEV_MAX_NAME;
+			len += sizeof(struct spdk_scsi_desig_desc) + SPDK_SCSI_DEV_MAX_NAME + 1;
 			len += sizeof(struct spdk_scsi_desig_desc) + SPDK_SCSI_PORT_MAX_NAME_LENGTH;
 			len += sizeof(struct spdk_scsi_desig_desc) + 4;
 			len += sizeof(struct spdk_scsi_desig_desc) + 4;
@@ -318,7 +340,7 @@ spdk_bdev_scsi_inquiry(struct spdk_bdev *bdev, struct spdk_scsi_task *task,
 			desig->reserved0 = 0;
 			desig->piv = 1;
 			desig->reserved1 = 0;
-			desig->len = snprintf(desig->desig, SPDK_SCSI_DEV_MAX_NAME, "%s", dev->name);
+			desig->len = spdk_bdev_scsi_pad_scsi_name(desig->desig, dev->name);
 			len += sizeof(struct spdk_scsi_desig_desc) + desig->len;
 
 			buf += sizeof(struct spdk_scsi_desig_desc) + desig->len;
@@ -450,9 +472,13 @@ spdk_bdev_scsi_inquiry(struct spdk_bdev *bdev, struct spdk_scsi_task *task,
 			hlen = 4;
 
 			/* Identification descriptor list */
-			for (i = 0; i < dev->num_ports; i++) {
+			for (i = 0; i < SPDK_SCSI_DEV_MAX_PORTS; i++) {
 				struct spdk_scsi_port_desc *sdesc;
 				struct spdk_scsi_tgt_port_desc *pdesc;
+
+				if (!dev->port[i].is_used) {
+					continue;
+				}
 
 				/* Identification descriptor N */
 				sdesc = (struct spdk_scsi_port_desc *)&vpage->params[len];
@@ -526,8 +552,9 @@ spdk_bdev_scsi_inquiry(struct spdk_bdev *bdev, struct spdk_scsi_task *task,
 			/* MAXIMUM COMPARE AND WRITE LENGTH */
 			blocks = SPDK_WORK_ATS_BLOCK_SIZE / block_size;
 
-			if (blocks > 0xff)
+			if (blocks > 0xff) {
 				blocks = 0xff;
+			}
 
 			data[5] = (uint8_t)blocks;
 
@@ -553,14 +580,13 @@ spdk_bdev_scsi_inquiry(struct spdk_bdev *bdev, struct spdk_scsi_task *task,
 			len = 20 - hlen;
 
 			if (spdk_bdev_io_type_supported(bdev, SPDK_BDEV_IO_TYPE_UNMAP)) {
-				uint32_t max_unmap_desc;
-
 				/*
 				 * MAXIMUM UNMAP LBA COUNT: indicates the
 				 * maximum  number of LBAs that may be
 				 * unmapped by an UNMAP command.
 				 */
-				to_be32(&data[20], g_spdk_scsi.scsi_params.max_unmap_lba_count);
+				/* For now, choose 4MB as the maximum. */
+				to_be32(&data[20], 4194304);
 
 				/*
 				 * MAXIMUM UNMAP BLOCK DESCRIPTOR COUNT:
@@ -568,34 +594,16 @@ spdk_bdev_scsi_inquiry(struct spdk_bdev *bdev, struct spdk_scsi_task *task,
 				 * block descriptors that shall be contained
 				 * in the parameter data transferred to the
 				 * device server for an UNMAP command.
+				 * The bdev layer automatically splits unmap
+				 * requests, so pick an arbitrary high number here.
 				 */
-				max_unmap_desc = spdk_min(spdk_bdev_get_max_unmap_descriptors(bdev),
-							  g_spdk_scsi.scsi_params.max_unmap_block_descriptor_count);
-				to_be32(&data[24], max_unmap_desc);
+				to_be32(&data[24], DEFAULT_MAX_UNMAP_BLOCK_DESCRIPTOR_COUNT);
 
 				/*
-				 * OPTIMAL UNMAP GRANULARITY: indicates the
-				 * optimal granularity in logical blocks
-				 * for unmap request.
+				 * The UGAVALID bit is left as 0 which means neither the
+				 * OPTIMAL UNMAP GRANULARITY nor the UNMAP GRANULARITY
+				 * ALIGNMENT fields are valid.
 				 */
-				to_be32(&data[28], g_spdk_scsi.scsi_params.optimal_unmap_granularity);
-
-				/*
-				 * UNMAP GRANULARITY ALIGNMENT: indicates the
-				 * LBA of the first logical block to which the
-				 * OPTIMAL UNMAP GRANULARITY field applies.
-				 */
-				/* not specified */
-				to_be32(&data[32], g_spdk_scsi.scsi_params.unmap_granularity_alignment);
-
-				/*
-				 * UGAVALID(7): bit set to one indicates that
-				 * the UNMAP GRANULARITY ALIGNMENT field is
-				 * valid.
-				 */
-				/* not specified */
-				if (g_spdk_scsi.scsi_params.ugavalid)
-					data[32] |= 1 << 7;
 
 				/*
 				 * MAXIMUM WRITE SAME LENGTH: indicates the
@@ -603,7 +611,7 @@ spdk_bdev_scsi_inquiry(struct spdk_bdev *bdev, struct spdk_scsi_task *task,
 				 * that the device server allows to be unmapped
 				 * or written in a single WRITE SAME command.
 				 */
-				to_be64(&data[36], g_spdk_scsi.scsi_params.max_write_same_length);
+				to_be64(&data[36], 512);
 
 				/* Reserved */
 				/* not specified */
@@ -671,7 +679,7 @@ spdk_bdev_scsi_inquiry(struct spdk_bdev *bdev, struct spdk_scsi_task *task,
 
 		default:
 			if (pc >= 0xc0 && pc <= 0xff) {
-				SPDK_TRACELOG(SPDK_TRACE_SCSI, "Vendor specific INQUIRY VPD page 0x%x\n", pc);
+				SPDK_DEBUGLOG(SPDK_LOG_SCSI, "Vendor specific INQUIRY VPD page 0x%x\n", pc);
 			} else {
 				SPDK_ERRLOG("unsupported INQUIRY VPD page 0x%x\n", pc);
 			}
@@ -683,7 +691,8 @@ spdk_bdev_scsi_inquiry(struct spdk_bdev *bdev, struct spdk_scsi_task *task,
 
 		/* Standard INQUIRY data */
 		/* PERIPHERAL QUALIFIER(7-5) PERIPHERAL DEVICE TYPE(4-0) */
-		inqdata->peripheral = pd;
+		inqdata->peripheral_device_type = pd;
+		inqdata->peripheral_qualifier = SPDK_SPC_PERIPHERAL_QUALIFIER_CONNECTED;
 
 		/* RMB(7) */
 		inqdata->rmb = 0;
@@ -797,8 +806,9 @@ inq_error:
 static void
 mode_sense_page_init(uint8_t *buf, int len, int page, int subpage)
 {
-	if (!buf)
+	if (!buf) {
 		return;
+	}
 
 	memset(buf, 0, len);
 	if (subpage != 0) {
@@ -844,20 +854,22 @@ spdk_bdev_scsi_mode_sense_page(struct spdk_bdev *bdev,
 		break;
 	case 0x01:
 		/* Read-Write Error Recovery */
-		SPDK_TRACELOG(SPDK_TRACE_SCSI,
+		SPDK_DEBUGLOG(SPDK_LOG_SCSI,
 			      "MODE_SENSE Read-Write Error Recovery\n");
-		if (subpage != 0x00)
+		if (subpage != 0x00) {
 			break;
+		}
 		plen = 0x0a + 2;
 		mode_sense_page_init(cp, plen, page, subpage);
 		len += plen;
 		break;
 	case 0x02:
 		/* Disconnect-Reconnect */
-		SPDK_TRACELOG(SPDK_TRACE_SCSI,
+		SPDK_DEBUGLOG(SPDK_LOG_SCSI,
 			      "MODE_SENSE Disconnect-Reconnect\n");
-		if (subpage != 0x00)
+		if (subpage != 0x00) {
 			break;
+		}
 		plen = 0x0e + 2;
 		mode_sense_page_init(cp, plen, page, subpage);
 		len += plen;
@@ -876,11 +888,12 @@ spdk_bdev_scsi_mode_sense_page(struct spdk_bdev *bdev,
 		break;
 	case 0x07:
 		/* Verify Error Recovery */
-		SPDK_TRACELOG(SPDK_TRACE_SCSI,
+		SPDK_DEBUGLOG(SPDK_LOG_SCSI,
 			      "MODE_SENSE Verify Error Recovery\n");
 
-		if (subpage != 0x00)
+		if (subpage != 0x00) {
 			break;
+		}
 
 		plen = 0x0a + 2;
 		mode_sense_page_init(cp, plen, page, subpage);
@@ -888,19 +901,22 @@ spdk_bdev_scsi_mode_sense_page(struct spdk_bdev *bdev,
 		break;
 	case 0x08: {
 		/* Caching */
-		SPDK_TRACELOG(SPDK_TRACE_SCSI, "MODE_SENSE Caching\n");
-		if (subpage != 0x00)
+		SPDK_DEBUGLOG(SPDK_LOG_SCSI, "MODE_SENSE Caching\n");
+		if (subpage != 0x00) {
 			break;
+		}
 
 		plen = 0x12 + 2;
 		mode_sense_page_init(cp, plen, page, subpage);
 
-		if (cp && spdk_bdev_has_write_cache(bdev) && pc != 0x01)
-			cp[2] |= 0x4; /* WCE */
+		if (cp && spdk_bdev_has_write_cache(bdev) && pc != 0x01) {
+			cp[2] |= 0x4;        /* WCE */
+		}
 
 		/* Read Cache Disable (RCD) = 1 */
-		if (cp && pc != 0x01)
+		if (cp && pc != 0x01) {
 			cp[2] |= 0x1;
+		}
 
 		len += plen;
 		break;
@@ -912,7 +928,7 @@ spdk_bdev_scsi_mode_sense_page(struct spdk_bdev *bdev,
 		switch (subpage) {
 		case 0x00:
 			/* Control */
-			SPDK_TRACELOG(SPDK_TRACE_SCSI,
+			SPDK_DEBUGLOG(SPDK_LOG_SCSI,
 				      "MODE_SENSE Control\n");
 			plen = 0x0a + 2;
 			mode_sense_page_init(cp, plen, page, subpage);
@@ -920,7 +936,7 @@ spdk_bdev_scsi_mode_sense_page(struct spdk_bdev *bdev,
 			break;
 		case 0x01:
 			/* Control Extension */
-			SPDK_TRACELOG(SPDK_TRACE_SCSI,
+			SPDK_DEBUGLOG(SPDK_LOG_SCSI,
 				      "MODE_SENSE Control Extension\n");
 			plen = 0x1c + 4;
 			mode_sense_page_init(cp, plen, page, subpage);
@@ -957,9 +973,10 @@ spdk_bdev_scsi_mode_sense_page(struct spdk_bdev *bdev,
 		break;
 	case 0x10:
 		/* XOR Control */
-		SPDK_TRACELOG(SPDK_TRACE_SCSI, "MODE_SENSE XOR Control\n");
-		if (subpage != 0x00)
+		SPDK_DEBUGLOG(SPDK_LOG_SCSI, "MODE_SENSE XOR Control\n");
+		if (subpage != 0x00) {
 			break;
+		}
 		plen = 0x16 + 2;
 		mode_sense_page_init(cp, plen, page, subpage);
 		len += plen;
@@ -985,10 +1002,11 @@ spdk_bdev_scsi_mode_sense_page(struct spdk_bdev *bdev,
 		break;
 	case 0x1a:
 		/* Power Condition */
-		SPDK_TRACELOG(SPDK_TRACE_SCSI,
+		SPDK_DEBUGLOG(SPDK_LOG_SCSI,
 			      "MODE_SENSE Power Condition\n");
-		if (subpage != 0x00)
+		if (subpage != 0x00) {
 			break;
+		}
 		plen = 0x0a + 2;
 		mode_sense_page_init(cp, plen, page, subpage);
 		len += plen;
@@ -998,10 +1016,11 @@ spdk_bdev_scsi_mode_sense_page(struct spdk_bdev *bdev,
 		break;
 	case 0x1c:
 		/* Informational Exceptions Control */
-		SPDK_TRACELOG(SPDK_TRACE_SCSI,
+		SPDK_DEBUGLOG(SPDK_LOG_SCSI,
 			      "MODE_SENSE Informational Exceptions Control\n");
-		if (subpage != 0x00)
+		if (subpage != 0x00) {
 			break;
+		}
 
 		plen = 0x0a + 2;
 		mode_sense_page_init(cp, plen, page, subpage);
@@ -1112,8 +1131,9 @@ spdk_bdev_scsi_mode_sense(struct spdk_bdev *bdev, int md,
 	}
 
 	total = hlen + blen + plen;
-	if (data == NULL)
+	if (data == NULL) {
 		return total;
+	}
 
 	hdr = &data[0];
 	if (hlen == 4) {
@@ -1140,10 +1160,11 @@ spdk_bdev_scsi_mode_sense(struct spdk_bdev *bdev, int md,
 		to_be32(&bdesc[12], block_size);
 	} else if (blen == 8) {
 		/* Number of Blocks */
-		if (num_blocks > 0xffffffffULL)
+		if (num_blocks > 0xffffffffULL) {
 			memset(&bdesc[0], 0xff, 4);
-		else
+		} else {
 			to_be32(&bdesc[0], num_blocks);
+		}
 
 		/* Block Length */
 		to_be32(&bdesc[4], block_size);
@@ -1175,16 +1196,18 @@ spdk_bdev_scsi_mode_select_page(struct spdk_bdev *bdev,
 	if (spf) {
 		/* Sub_page mode page format */
 		hlen = 4;
-		if (len < hlen)
+		if (len < hlen) {
 			return 0;
+		}
 		subpage = data[1];
 
 		plen = from_be16(&data[2]);
 	} else {
 		/* Page_0 mode page format */
 		hlen = 2;
-		if (len < hlen)
+		if (len < hlen) {
 			return 0;
+		}
 		subpage = 0;
 		plen = data[1];
 	}
@@ -1198,9 +1221,10 @@ spdk_bdev_scsi_mode_select_page(struct spdk_bdev *bdev,
 	case 0x08: { /* Caching */
 		//int wce;
 
-		SPDK_TRACELOG(SPDK_TRACE_SCSI, "MODE_SELECT Caching\n");
-		if (subpage != 0x00)
+		SPDK_DEBUGLOG(SPDK_LOG_SCSI, "MODE_SELECT Caching\n");
+		if (subpage != 0x00) {
 			break;
+		}
 
 		if (plen != 0x12 + hlen) {
 			/* unknown format */
@@ -1215,7 +1239,7 @@ spdk_bdev_scsi_mode_select_page(struct spdk_bdev *bdev,
 		//rc = fcntl(fd, F_GETFL, 0);
 		//if (rc != -1) {
 		//	if (wce) {
-		//		SPDK_TRACELOG(SPDK_TRACE_SCSI, "MODE_SELECT Writeback cache enable\n");
+		//		SPDK_DEBUGLOG(SPDK_LOG_SCSI, "MODE_SELECT Writeback cache enable\n");
 		//		rc = fcntl(fd, F_SETFL, (rc & ~O_FSYNC));
 		//		bdev->write_cache = 1;
 		//	} else {
@@ -1248,7 +1272,7 @@ spdk_bdev_scsi_task_complete_cmd(struct spdk_bdev_io *bdev_io, bool success,
 	struct spdk_scsi_task *task = cb_arg;
 	int sc, sk, asc, ascq;
 
-	task->blockdev_io = bdev_io;
+	task->bdev_io = bdev_io;
 
 	spdk_bdev_io_get_scsi_status(bdev_io, &sc, &sk, &asc, &ascq);
 	spdk_scsi_task_set_status(task, sc, sk, asc, ascq);
@@ -1261,7 +1285,7 @@ spdk_bdev_scsi_task_complete_mgmt(struct spdk_bdev_io *bdev_io, bool success,
 {
 	struct spdk_scsi_task *task = cb_arg;
 
-	task->blockdev_io = bdev_io;
+	task->bdev_io = bdev_io;
 
 	if (success) {
 		task->response = SPDK_SCSI_TASK_MGMT_RESP_SUCCESS;
@@ -1271,46 +1295,9 @@ spdk_bdev_scsi_task_complete_mgmt(struct spdk_bdev_io *bdev_io, bool success,
 }
 
 static int
-spdk_bdev_scsi_read_write_lba_check(struct spdk_scsi_task *primary,
-				    struct spdk_scsi_task *task,
-				    uint64_t lba, uint64_t cmd_num_blocks,
-				    uint64_t bdev_num_blocks)
-{
-	if (!primary) {
-		/*
-		 * Indicates this task is a primary task, we check whether the LBA and
-		 * range is valid. If such info of primary is valid, all subtasks' are valid.
-		 */
-		if (lba >= bdev_num_blocks || cmd_num_blocks > bdev_num_blocks ||
-		    lba > (bdev_num_blocks - cmd_num_blocks)) {
-			SPDK_TRACELOG(SPDK_TRACE_SCSI, "end of media\n");
-			spdk_scsi_task_set_status(task, SPDK_SCSI_STATUS_CHECK_CONDITION,
-						  SPDK_SCSI_SENSE_ILLEGAL_REQUEST,
-						  SPDK_SCSI_ASC_LOGICAL_BLOCK_ADDRESS_OUT_OF_RANGE,
-						  SPDK_SCSI_ASCQ_CAUSE_NOT_REPORTABLE);
-			return -1;
-		}
-	} else {
-		/*
-		 * Indicates this task is a subtask, we do not need to check the LBA range.
-		 * Need to check condition of primary task.
-		 */
-		if (primary->status == SPDK_SCSI_STATUS_CHECK_CONDITION) {
-			memcpy(task->sense_data, primary->sense_data,
-			       primary->sense_data_len);
-			task->status = SPDK_SCSI_STATUS_CHECK_CONDITION;
-			task->sense_data_len = primary->sense_data_len;
-			return -1;
-		}
-	}
-
-	return 0;
-}
-
-static int
-spdk_bdev_scsi_read(struct spdk_bdev *bdev,
-		    struct spdk_scsi_task *task, uint64_t lba,
-		    uint32_t len)
+spdk_bdev_scsi_read(struct spdk_bdev *bdev, struct spdk_bdev_desc *bdev_desc,
+		    struct spdk_io_channel *bdev_ch, struct spdk_scsi_task *task,
+		    uint64_t lba, uint32_t len)
 {
 	uint64_t blen;
 	uint64_t offset;
@@ -1323,11 +1310,11 @@ spdk_bdev_scsi_read(struct spdk_bdev *bdev,
 	offset = lba * blen;
 	nbytes = task->length;
 
-	SPDK_TRACELOG(SPDK_TRACE_SCSI,
+	SPDK_DEBUGLOG(SPDK_LOG_SCSI,
 		      "Read: lba=%"PRIu64", len=%"PRIu64"\n",
 		      lba, (uint64_t)task->length / blen);
 
-	rc = spdk_bdev_readv(bdev, task->ch, task->iovs,
+	rc = spdk_bdev_readv(bdev_desc, bdev_ch, task->iovs,
 			     task->iovcnt, offset, nbytes,
 			     spdk_bdev_scsi_task_complete_cmd, task);
 	if (rc) {
@@ -1346,29 +1333,20 @@ spdk_bdev_scsi_read(struct spdk_bdev *bdev,
 }
 
 static int
-spdk_bdev_scsi_write(struct spdk_bdev *bdev,
-		     struct spdk_scsi_task *task, uint64_t lba, uint32_t len)
+spdk_bdev_scsi_write(struct spdk_bdev *bdev, struct spdk_bdev_desc *bdev_desc,
+		     struct spdk_io_channel *bdev_ch, struct spdk_scsi_task *task,
+		     uint64_t lba, uint32_t len)
 {
 	uint64_t blen;
 	uint64_t offset;
 	uint64_t nbytes;
 	int rc;
-	struct spdk_scsi_task *primary = task->parent;
-
-	if (len == 0) {
-		task->data_transferred = 0;
-		spdk_scsi_task_set_status(task, SPDK_SCSI_STATUS_CHECK_CONDITION,
-					  SPDK_SCSI_SENSE_NO_SENSE,
-					  SPDK_SCSI_ASC_NO_ADDITIONAL_SENSE,
-					  SPDK_SCSI_ASCQ_CAUSE_NOT_REPORTABLE);
-		return SPDK_SCSI_TASK_COMPLETE;
-	}
 
 	blen = spdk_bdev_get_block_size(bdev);
 	offset = lba * blen;
 	nbytes = ((uint64_t)len) * blen;
 
-	SPDK_TRACELOG(SPDK_TRACE_SCSI,
+	SPDK_DEBUGLOG(SPDK_LOG_SCSI,
 		      "Write: lba=%"PRIu64", len=%u\n",
 		      lba, len);
 
@@ -1383,7 +1361,7 @@ spdk_bdev_scsi_write(struct spdk_bdev *bdev,
 	}
 
 	offset += task->offset;
-	rc = spdk_bdev_writev(bdev, task->ch, task->iovs,
+	rc = spdk_bdev_writev(bdev_desc, bdev_ch, task->iovs,
 			      task->iovcnt, offset, task->length,
 			      spdk_bdev_scsi_task_complete_cmd,
 			      task);
@@ -1395,29 +1373,22 @@ spdk_bdev_scsi_write(struct spdk_bdev *bdev,
 					  SPDK_SCSI_ASC_NO_ADDITIONAL_SENSE,
 					  SPDK_SCSI_ASCQ_CAUSE_NOT_REPORTABLE);
 		return SPDK_SCSI_TASK_COMPLETE;
-	} else {
-		if (!primary) {
-			task->data_transferred += task->length;
-		} else {
-			primary->data_transferred += task->length;
-		}
 	}
 
-	SPDK_TRACELOG(SPDK_TRACE_SCSI, "Wrote %"PRIu64"/%"PRIu64" bytes\n",
+	SPDK_DEBUGLOG(SPDK_LOG_SCSI, "Wrote %"PRIu64"/%"PRIu64" bytes\n",
 		      (uint64_t)task->length, nbytes);
 
+	task->data_transferred = task->length;
 	task->status = SPDK_SCSI_STATUS_GOOD;
 	return SPDK_SCSI_TASK_PENDING;
 }
 
 static int
-spdk_bdev_scsi_sync(struct spdk_bdev *bdev, struct spdk_scsi_task *task,
+spdk_bdev_scsi_sync(struct spdk_bdev *bdev, struct spdk_bdev_desc *bdev_desc,
+		    struct spdk_io_channel *bdev_ch, struct spdk_scsi_task *task,
 		    uint64_t lba, uint32_t num_blocks)
 {
 	uint64_t bdev_num_blocks;
-	uint64_t blen;
-	uint64_t offset;
-	uint64_t nbytes;
 	int rc;
 
 	if (num_blocks == 0) {
@@ -1425,9 +1396,6 @@ spdk_bdev_scsi_sync(struct spdk_bdev *bdev, struct spdk_scsi_task *task,
 	}
 
 	bdev_num_blocks = spdk_bdev_get_num_blocks(bdev);
-	blen = spdk_bdev_get_block_size(bdev);
-	offset = lba * blen;
-	nbytes = num_blocks * blen;
 
 	if (lba >= bdev_num_blocks || num_blocks > bdev_num_blocks ||
 	    lba > (bdev_num_blocks - num_blocks)) {
@@ -1439,11 +1407,11 @@ spdk_bdev_scsi_sync(struct spdk_bdev *bdev, struct spdk_scsi_task *task,
 		return SPDK_SCSI_TASK_COMPLETE;
 	}
 
-	rc = spdk_bdev_flush(bdev, task->ch, offset, nbytes,
-			     spdk_bdev_scsi_task_complete_cmd, task);
+	rc = spdk_bdev_flush_blocks(bdev_desc, bdev_ch, lba, num_blocks,
+				    spdk_bdev_scsi_task_complete_cmd, task);
 
 	if (rc) {
-		SPDK_ERRLOG("spdk_bdev_flush() failed\n");
+		SPDK_ERRLOG("spdk_bdev_flush_blocks() failed\n");
 		spdk_scsi_task_set_status(task, SPDK_SCSI_STATUS_CHECK_CONDITION,
 					  SPDK_SCSI_SENSE_NO_SENSE,
 					  SPDK_SCSI_ASC_NO_ADDITIONAL_SENSE,
@@ -1456,12 +1424,20 @@ spdk_bdev_scsi_sync(struct spdk_bdev *bdev, struct spdk_scsi_task *task,
 }
 
 static int
-spdk_bdev_scsi_readwrite(struct spdk_bdev *bdev,
-			 struct spdk_scsi_task *task,
+spdk_bdev_scsi_readwrite(struct spdk_scsi_task *task,
 			 uint64_t lba, uint32_t xfer_len, bool is_read)
 {
-	if (task->dxfer_dir != SPDK_SCSI_DIR_NONE &&
-	    task->dxfer_dir != (is_read ? SPDK_SCSI_DIR_FROM_DEV : SPDK_SCSI_DIR_TO_DEV)) {
+	struct spdk_scsi_lun *lun = task->lun;
+	struct spdk_bdev *bdev = lun->bdev;
+	struct spdk_bdev_desc *bdev_desc = lun->bdev_desc;
+	struct spdk_io_channel *bdev_ch = lun->io_channel;
+	uint64_t bdev_num_blocks;
+	uint32_t max_xfer_len;
+
+	task->data_transferred = 0;
+
+	if (spdk_unlikely(task->dxfer_dir != SPDK_SCSI_DIR_NONE &&
+			  task->dxfer_dir != (is_read ? SPDK_SCSI_DIR_FROM_DEV : SPDK_SCSI_DIR_TO_DEV))) {
 		SPDK_ERRLOG("Incorrect data direction\n");
 		spdk_scsi_task_set_status(task, SPDK_SCSI_STATUS_CHECK_CONDITION,
 					  SPDK_SCSI_SENSE_NO_SENSE,
@@ -1470,70 +1446,26 @@ spdk_bdev_scsi_readwrite(struct spdk_bdev *bdev,
 		return SPDK_SCSI_TASK_COMPLETE;
 	}
 
-	if (spdk_bdev_scsi_read_write_lba_check(task->parent, task, lba,
-						xfer_len, spdk_bdev_get_num_blocks(bdev)) < 0) {
-		/* spdk_bdev_scsi_read_write_lba_check() already set the correct sense code */
-		return SPDK_SCSI_TASK_COMPLETE;
-	}
-
-	if (is_read) {
-		return spdk_bdev_scsi_read(bdev, task, lba, xfer_len);
-	} else {
-		return spdk_bdev_scsi_write(bdev, task, lba, xfer_len);
-	}
-}
-
-static int
-spdk_bdev_scsi_unmap(struct spdk_bdev *bdev,
-		     struct spdk_scsi_task *task)
-{
-
-	uint8_t *data;
-	struct spdk_scsi_unmap_bdesc *desc;
-	uint32_t bdesc_count, max_unmap_bdesc_count;
-	int bdesc_data_len;
-	int data_len;
-	int rc;
-
-	if (task->iovcnt == 1) {
-		data = (uint8_t *)task->iovs[0].iov_base;
-		data_len = task->iovs[0].iov_len;
-	} else {
-		data = spdk_scsi_task_gather_data(task, &data_len);
-	}
-
-	/*
-	 * The UNMAP BLOCK DESCRIPTOR DATA LENGTH field specifies the length in
-	 * bytes of the UNMAP block descriptors that are available to be
-	 * transferred from the Data-Out Buffer. The unmap block descriptor data
-	 * length should be a multiple of 16. If the unmap block descriptor data
-	 * length is not a multiple of 16, then the last unmap block descriptor
-	 * is incomplete and shall be ignored.
-	 */
-	bdesc_data_len = from_be16(&data[2]);
-	bdesc_count = bdesc_data_len / 16;
-	assert(bdesc_data_len <= data_len);
-
-	if (task->iovcnt == 1) {
-		desc = (struct spdk_scsi_unmap_bdesc *)&data[8];
-	} else {
-		desc = spdk_scsi_task_alloc_data(task, bdesc_data_len - 8);
-		memcpy(desc, &data[8], bdesc_data_len - 8);
-		spdk_dma_free(data);
-	}
-
-	max_unmap_bdesc_count = spdk_bdev_get_max_unmap_descriptors(bdev);
-	if (bdesc_count > max_unmap_bdesc_count) {
-		SPDK_ERRLOG("Error - supported unmap block descriptor count limit"
-			    " is %u\n", max_unmap_bdesc_count);
+	bdev_num_blocks = spdk_bdev_get_num_blocks(bdev);
+	if (spdk_unlikely(bdev_num_blocks <= lba || bdev_num_blocks - lba < xfer_len)) {
+		SPDK_DEBUGLOG(SPDK_LOG_SCSI, "end of media\n");
 		spdk_scsi_task_set_status(task, SPDK_SCSI_STATUS_CHECK_CONDITION,
-					  SPDK_SCSI_SENSE_NO_SENSE,
-					  SPDK_SCSI_ASC_NO_ADDITIONAL_SENSE,
+					  SPDK_SCSI_SENSE_ILLEGAL_REQUEST,
+					  SPDK_SCSI_ASC_LOGICAL_BLOCK_ADDRESS_OUT_OF_RANGE,
 					  SPDK_SCSI_ASCQ_CAUSE_NOT_REPORTABLE);
 		return SPDK_SCSI_TASK_COMPLETE;
-	} else if (bdesc_data_len > data_len) {
-		SPDK_ERRLOG("Error - bdesc_data_len (%d) > data_len (%d)",
-			    bdesc_data_len, data_len);
+	}
+
+	if (spdk_unlikely(xfer_len == 0)) {
+		task->status = SPDK_SCSI_STATUS_GOOD;
+		return SPDK_SCSI_TASK_COMPLETE;
+	}
+
+	/* Transfer Length is limited to the Block Limits VPD page Maximum Transfer Length */
+	max_xfer_len = SPDK_WORK_BLOCK_SIZE / spdk_bdev_get_block_size(bdev);
+	if (spdk_unlikely(xfer_len > max_xfer_len)) {
+		SPDK_ERRLOG("xfer_len %" PRIu32 " > maximum transfer length %" PRIu32 "\n",
+			    xfer_len, max_xfer_len);
 		spdk_scsi_task_set_status(task, SPDK_SCSI_STATUS_CHECK_CONDITION,
 					  SPDK_SCSI_SENSE_ILLEGAL_REQUEST,
 					  SPDK_SCSI_ASC_INVALID_FIELD_IN_CDB,
@@ -1541,12 +1473,88 @@ spdk_bdev_scsi_unmap(struct spdk_bdev *bdev,
 		return SPDK_SCSI_TASK_COMPLETE;
 	}
 
-	rc = spdk_bdev_unmap(bdev, task->ch, desc,
-			     bdesc_count, spdk_bdev_scsi_task_complete_cmd,
-			     task);
+	if (is_read) {
+		return spdk_bdev_scsi_read(bdev, bdev_desc, bdev_ch, task, lba, xfer_len);
+	} else {
+		return spdk_bdev_scsi_write(bdev, bdev_desc, bdev_ch, task, lba, xfer_len);
+	}
+}
 
-	if (rc) {
-		SPDK_ERRLOG("SCSI Unmapping failed\n");
+struct spdk_bdev_scsi_unmap_ctx {
+	struct spdk_scsi_task		*task;
+	struct spdk_scsi_unmap_bdesc	desc[DEFAULT_MAX_UNMAP_BLOCK_DESCRIPTOR_COUNT];
+	uint32_t			count;
+};
+
+static void
+spdk_bdev_scsi_task_complete_unmap_cmd(struct spdk_bdev_io *bdev_io, bool success,
+				       void *cb_arg)
+{
+	struct spdk_bdev_scsi_unmap_ctx *ctx = cb_arg;
+	struct spdk_scsi_task *task = ctx->task;
+	int sc, sk, asc, ascq;
+
+	ctx->count--;
+
+	task->bdev_io = bdev_io;
+
+	if (task->status == SPDK_SCSI_STATUS_GOOD) {
+		spdk_bdev_io_get_scsi_status(bdev_io, &sc, &sk, &asc, &ascq);
+		spdk_scsi_task_set_status(task, sc, sk, asc, ascq);
+	}
+
+	if (ctx->count == 0) {
+		spdk_scsi_lun_complete_task(task->lun, task);
+		free(ctx);
+	}
+}
+
+static int
+__copy_desc(struct spdk_bdev_scsi_unmap_ctx *ctx, uint8_t *data, size_t data_len)
+{
+	uint16_t	desc_data_len;
+	uint16_t	desc_count;
+
+	if (!data) {
+		return -EINVAL;
+	}
+
+	if (data_len < 8) {
+		/* We can't even get the reported length, so fail. */
+		return -EINVAL;
+	}
+
+	desc_data_len = from_be16(&data[2]);
+	desc_count = desc_data_len / 16;
+
+	if (desc_data_len > (data_len - 8)) {
+		SPDK_ERRLOG("Error - desc_data_len (%u) > data_len (%lu) - 8\n",
+			    desc_data_len, data_len);
+		return -EINVAL;
+	}
+
+	if (desc_count > DEFAULT_MAX_UNMAP_BLOCK_DESCRIPTOR_COUNT) {
+		SPDK_ERRLOG("desc_count (%u) greater than max allowed (%u)\n",
+			    desc_count, DEFAULT_MAX_UNMAP_BLOCK_DESCRIPTOR_COUNT);
+		return -EINVAL;
+	}
+
+	memcpy(ctx->desc, &data[8], desc_data_len);
+	return desc_count;
+}
+
+static int
+spdk_bdev_scsi_unmap(struct spdk_bdev *bdev, struct spdk_bdev_desc *bdev_desc,
+		     struct spdk_io_channel *bdev_ch, struct spdk_scsi_task *task)
+{
+	uint8_t				*data;
+	struct spdk_bdev_scsi_unmap_ctx	*ctx;
+	int				desc_count, i;
+	int				data_len;
+	int				rc;
+
+	ctx = calloc(1, sizeof(*ctx));
+	if (!ctx) {
 		spdk_scsi_task_set_status(task, SPDK_SCSI_STATUS_CHECK_CONDITION,
 					  SPDK_SCSI_SENSE_NO_SENSE,
 					  SPDK_SCSI_ASC_NO_ADDITIONAL_SENSE,
@@ -1554,13 +1562,80 @@ spdk_bdev_scsi_unmap(struct spdk_bdev *bdev,
 		return SPDK_SCSI_TASK_COMPLETE;
 	}
 
+	ctx->task = task;
+	ctx->count = 0;
+
+	if (task->iovcnt == 1) {
+		data = (uint8_t *)task->iovs[0].iov_base;
+		data_len = task->iovs[0].iov_len;
+		desc_count = __copy_desc(ctx, data, data_len);
+	} else {
+		data = spdk_scsi_task_gather_data(task, &data_len);
+		desc_count = __copy_desc(ctx, data, data_len);
+		if (desc_count < 0) {
+			spdk_dma_free(data);
+		}
+	}
+
+	if (desc_count < 0) {
+		spdk_scsi_task_set_status(task, SPDK_SCSI_STATUS_CHECK_CONDITION,
+					  SPDK_SCSI_SENSE_ILLEGAL_REQUEST,
+					  SPDK_SCSI_ASC_INVALID_FIELD_IN_CDB,
+					  SPDK_SCSI_ASCQ_CAUSE_NOT_REPORTABLE);
+		free(ctx);
+		return SPDK_SCSI_TASK_COMPLETE;
+	}
+
+	/* Before we submit commands, set the status to success */
+	spdk_scsi_task_set_status(task, SPDK_SCSI_STATUS_GOOD,
+				  SPDK_SCSI_SENSE_NO_SENSE,
+				  SPDK_SCSI_ASC_NO_ADDITIONAL_SENSE,
+				  SPDK_SCSI_ASCQ_CAUSE_NOT_REPORTABLE);
+
+	for (i = 0; i < desc_count; i++) {
+		struct spdk_scsi_unmap_bdesc	*desc;
+		uint64_t offset_blocks;
+		uint64_t num_blocks;
+
+		desc = &ctx->desc[i];
+
+		offset_blocks = from_be64(&desc->lba);
+		num_blocks = from_be32(&desc->block_count);
+
+		if (num_blocks == 0) {
+			continue;
+		}
+
+		ctx->count++;
+		rc = spdk_bdev_unmap_blocks(bdev_desc, bdev_ch, offset_blocks, num_blocks,
+					    spdk_bdev_scsi_task_complete_unmap_cmd, ctx);
+
+		if (rc) {
+			SPDK_ERRLOG("SCSI Unmapping failed\n");
+			spdk_scsi_task_set_status(task, SPDK_SCSI_STATUS_CHECK_CONDITION,
+						  SPDK_SCSI_SENSE_NO_SENSE,
+						  SPDK_SCSI_ASC_NO_ADDITIONAL_SENSE,
+						  SPDK_SCSI_ASCQ_CAUSE_NOT_REPORTABLE);
+			ctx->count--;
+			/* We can't complete here - we may have to wait for previously
+			 * submitted unmaps to complete */
+			break;
+		}
+	}
+
+	if (ctx->count == 0) {
+		free(ctx);
+		return SPDK_SCSI_TASK_COMPLETE;
+	}
+
 	return SPDK_SCSI_TASK_PENDING;
 }
 
 static int
-spdk_bdev_scsi_process_block(struct spdk_bdev *bdev,
-			     struct spdk_scsi_task *task)
+spdk_bdev_scsi_process_block(struct spdk_scsi_task *task)
 {
+	struct spdk_scsi_lun *lun = task->lun;
+	struct spdk_bdev *bdev = lun->bdev;
 	uint64_t lba;
 	uint32_t xfer_len;
 	uint32_t len = 0;
@@ -1577,27 +1652,27 @@ spdk_bdev_scsi_process_block(struct spdk_bdev *bdev,
 		if (xfer_len == 0) {
 			xfer_len = 256;
 		}
-		return spdk_bdev_scsi_readwrite(bdev, task, lba, xfer_len,
+		return spdk_bdev_scsi_readwrite(task, lba, xfer_len,
 						cdb[0] == SPDK_SBC_READ_6);
 
 	case SPDK_SBC_READ_10:
 	case SPDK_SBC_WRITE_10:
 		lba = from_be32(&cdb[2]);
 		xfer_len = from_be16(&cdb[7]);
-		return spdk_bdev_scsi_readwrite(bdev, task, lba, xfer_len,
+		return spdk_bdev_scsi_readwrite(task, lba, xfer_len,
 						cdb[0] == SPDK_SBC_READ_10);
 
 	case SPDK_SBC_READ_12:
 	case SPDK_SBC_WRITE_12:
 		lba = from_be32(&cdb[2]);
 		xfer_len = from_be32(&cdb[6]);
-		return spdk_bdev_scsi_readwrite(bdev, task, lba, xfer_len,
+		return spdk_bdev_scsi_readwrite(task, lba, xfer_len,
 						cdb[0] == SPDK_SBC_READ_12);
 	case SPDK_SBC_READ_16:
 	case SPDK_SBC_WRITE_16:
 		lba = from_be64(&cdb[2]);
 		xfer_len = from_be32(&cdb[10]);
-		return spdk_bdev_scsi_readwrite(bdev, task, lba, xfer_len,
+		return spdk_bdev_scsi_readwrite(task, lba, xfer_len,
 						cdb[0] == SPDK_SBC_READ_16);
 
 	case SPDK_SBC_READ_CAPACITY_10: {
@@ -1612,8 +1687,9 @@ spdk_bdev_scsi_process_block(struct spdk_bdev *bdev,
 		to_be32(&buffer[4], spdk_bdev_get_block_size(bdev));
 
 		len = spdk_min(task->length, sizeof(buffer));
-		if (spdk_scsi_task_scatter_data(task, buffer, len) < 0)
+		if (spdk_scsi_task_scatter_data(task, buffer, len) < 0) {
 			break;
+		}
 
 		task->data_transferred = len;
 		task->status = SPDK_SCSI_STATUS_GOOD;
@@ -1637,8 +1713,9 @@ spdk_bdev_scsi_process_block(struct spdk_bdev *bdev,
 			}
 
 			len = spdk_min(from_be32(&cdb[10]), sizeof(buffer));
-			if (spdk_scsi_task_scatter_data(task, buffer, len) < 0)
+			if (spdk_scsi_task_scatter_data(task, buffer, len) < 0) {
 				break;
+			}
 
 			task->data_transferred = len;
 			task->status = SPDK_SCSI_STATUS_GOOD;
@@ -1664,11 +1741,11 @@ spdk_bdev_scsi_process_block(struct spdk_bdev *bdev,
 			len = spdk_bdev_get_num_blocks(bdev) - lba;
 		}
 
-		return spdk_bdev_scsi_sync(bdev, task, lba, len);
+		return spdk_bdev_scsi_sync(bdev, lun->bdev_desc, lun->io_channel, task, lba, len);
 		break;
 
 	case SPDK_SBC_UNMAP:
-		return spdk_bdev_scsi_unmap(bdev, task);
+		return spdk_bdev_scsi_unmap(bdev, lun->bdev_desc, lun->io_channel, task);
 
 	default:
 		return SPDK_SCSI_TASK_UNKNOWN;
@@ -1680,8 +1757,9 @@ spdk_bdev_scsi_process_block(struct spdk_bdev *bdev,
 static int
 spdk_bdev_scsi_check_len(struct spdk_scsi_task *task, int len, int min_len)
 {
-	if (len >= min_len)
+	if (len >= min_len) {
 		return 0;
+	}
 
 	/* INVALID FIELD IN CDB */
 	spdk_scsi_task_set_status(task, SPDK_SCSI_STATUS_CHECK_CONDITION,
@@ -1692,9 +1770,10 @@ spdk_bdev_scsi_check_len(struct spdk_scsi_task *task, int len, int min_len)
 }
 
 static int
-spdk_bdev_scsi_process_primary(struct spdk_bdev *bdev,
-			       struct spdk_scsi_task *task)
+spdk_bdev_scsi_process_primary(struct spdk_scsi_task *task)
 {
+	struct spdk_scsi_lun *lun = task->lun;
+	struct spdk_bdev *bdev = lun->bdev;
 	int alloc_len = -1;
 	int data_len = -1;
 	uint8_t *cdb = task->cdb;
@@ -1702,7 +1781,7 @@ spdk_bdev_scsi_process_primary(struct spdk_bdev *bdev,
 	int rc = 0;
 	int pllen, md = 0;
 	int pf, sp;
-	int bdlen, llba;
+	int bdlen = 0, llba;
 	int dbd, pc, page, subpage;
 	int cmd_parsed = 0;
 
@@ -1719,14 +1798,14 @@ spdk_bdev_scsi_process_primary(struct spdk_bdev *bdev,
 			break;
 		}
 
-		SPDK_TRACEDUMP(SPDK_TRACE_DEBUG, "INQUIRY", data, data_len);
+		SPDK_TRACEDUMP(SPDK_LOG_SCSI, "INQUIRY", data, data_len);
 		break;
 
 	case SPDK_SPC_REPORT_LUNS: {
 		int sel;
 
 		sel = cdb[2];
-		SPDK_TRACELOG(SPDK_TRACE_DEBUG, "sel=%x\n", sel);
+		SPDK_DEBUGLOG(SPDK_LOG_SCSI, "sel=%x\n", sel);
 
 		alloc_len = from_be32(&cdb[6]);
 		rc = spdk_bdev_scsi_check_len(task, alloc_len, 16);
@@ -1747,7 +1826,7 @@ spdk_bdev_scsi_process_primary(struct spdk_bdev *bdev,
 			break;
 		}
 
-		SPDK_TRACEDUMP(SPDK_TRACE_DEBUG, "REPORT LUNS", data, data_len);
+		SPDK_TRACEDUMP(SPDK_LOG_SCSI, "REPORT LUNS", data, data_len);
 		break;
 	}
 
@@ -1892,12 +1971,12 @@ spdk_bdev_scsi_process_primary(struct spdk_bdev *bdev,
 	}
 
 	case SPDK_SPC_LOG_SELECT:
-		SPDK_TRACELOG(SPDK_TRACE_SCSI, "LOG_SELECT\n");
+		SPDK_DEBUGLOG(SPDK_LOG_SCSI, "LOG_SELECT\n");
 		cmd_parsed = 1;
 	/* FALLTHROUGH */
 	case SPDK_SPC_LOG_SENSE:
 		if (!cmd_parsed) {
-			SPDK_TRACELOG(SPDK_TRACE_SCSI, "LOG_SENSE\n");
+			SPDK_DEBUGLOG(SPDK_LOG_SCSI, "LOG_SENSE\n");
 		}
 
 		/* INVALID COMMAND OPERATION CODE */
@@ -1909,12 +1988,12 @@ spdk_bdev_scsi_process_primary(struct spdk_bdev *bdev,
 		break;
 
 	case SPDK_SPC_TEST_UNIT_READY:
-		SPDK_TRACELOG(SPDK_TRACE_SCSI, "TEST_UNIT_READY\n");
+		SPDK_DEBUGLOG(SPDK_LOG_SCSI, "TEST_UNIT_READY\n");
 		cmd_parsed = 1;
 	/* FALLTHROUGH */
 	case SPDK_SBC_START_STOP_UNIT:
 		if (!cmd_parsed) {
-			SPDK_TRACELOG(SPDK_TRACE_SCSI, "START_STOP_UNIT\n");
+			SPDK_DEBUGLOG(SPDK_LOG_SCSI, "START_STOP_UNIT\n");
 		}
 
 		rc = 0;
@@ -1935,20 +2014,21 @@ spdk_bdev_scsi_process_primary(struct spdk_bdev *bdev,
 		task->status = SPDK_SCSI_STATUS_GOOD;
 	}
 
-	if (data)
+	if (data) {
 		spdk_dma_free(data);
+	}
 
 	return SPDK_SCSI_TASK_COMPLETE;
 }
 
 int
-spdk_bdev_scsi_execute(struct spdk_bdev *bdev, struct spdk_scsi_task *task)
+spdk_bdev_scsi_execute(struct spdk_scsi_task *task)
 {
 	int rc;
 
-	if ((rc = spdk_bdev_scsi_process_block(bdev, task)) == SPDK_SCSI_TASK_UNKNOWN) {
-		if ((rc = spdk_bdev_scsi_process_primary(bdev, task)) == SPDK_SCSI_TASK_UNKNOWN) {
-			SPDK_TRACELOG(SPDK_TRACE_SCSI, "unsupported SCSI OP=0x%x\n", task->cdb[0]);
+	if ((rc = spdk_bdev_scsi_process_block(task)) == SPDK_SCSI_TASK_UNKNOWN) {
+		if ((rc = spdk_bdev_scsi_process_primary(task)) == SPDK_SCSI_TASK_UNKNOWN) {
+			SPDK_DEBUGLOG(SPDK_LOG_SCSI, "unsupported SCSI OP=0x%x\n", task->cdb[0]);
 			/* INVALID COMMAND OPERATION CODE */
 			spdk_scsi_task_set_status(task, SPDK_SCSI_STATUS_CHECK_CONDITION,
 						  SPDK_SCSI_SENSE_ILLEGAL_REQUEST,
@@ -1962,8 +2042,10 @@ spdk_bdev_scsi_execute(struct spdk_bdev *bdev, struct spdk_scsi_task *task)
 }
 
 int
-spdk_bdev_scsi_reset(struct spdk_bdev *bdev, struct spdk_scsi_task *task)
+spdk_bdev_scsi_reset(struct spdk_scsi_task *task)
 {
-	return spdk_bdev_reset(bdev, task->ch,
+	struct spdk_scsi_lun *lun = task->lun;
+
+	return spdk_bdev_reset(lun->bdev_desc, lun->io_channel,
 			       spdk_bdev_scsi_task_complete_mgmt, task);
 }

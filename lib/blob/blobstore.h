@@ -39,6 +39,8 @@
 #include "spdk/queue.h"
 #include "spdk/util.h"
 
+#include "request.h"
+
 /* In Memory Data Structures
  *
  * The following data structures exist only in memory.
@@ -47,7 +49,8 @@
 #define SPDK_BLOB_OPTS_CLUSTER_SZ (1024 * 1024)
 #define SPDK_BLOB_OPTS_NUM_MD_PAGES UINT32_MAX
 #define SPDK_BLOB_OPTS_MAX_MD_OPS 32
-#define SPDK_BLOB_OPTS_MAX_CHANNEL_OPS 512
+#define SPDK_BLOB_OPTS_DEFAULT_CHANNEL_OPS 512
+#define SPDK_BLOB_BLOBID_HIGH_BIT (1ULL << 32)
 
 struct spdk_xattr {
 	/* TODO: reorder for best packing */
@@ -98,11 +101,15 @@ enum spdk_blob_state {
 	/* The in-memory state being synchronized with the on-disk
 	 * blob state. */
 	SPDK_BLOB_STATE_LOADING,
+};
 
-	/* The disk state is being synchronized with the current
-	 * blob state.
-	 */
-	SPDK_BLOB_STATE_SYNCING,
+TAILQ_HEAD(spdk_xattr_tailq, spdk_xattr);
+
+struct spdk_blob_list {
+	spdk_blob_id id;
+	size_t clone_count;
+	TAILQ_HEAD(, spdk_blob_list) clones;
+	TAILQ_ENTRY(spdk_blob_list) link;
 };
 
 struct spdk_blob {
@@ -111,6 +118,7 @@ struct spdk_blob {
 	uint32_t	open_ref;
 
 	spdk_blob_id	id;
+	spdk_blob_id	parent_id;
 
 	enum spdk_blob_state		state;
 
@@ -122,41 +130,61 @@ struct spdk_blob {
 	struct spdk_blob_mut_data	clean;
 	struct spdk_blob_mut_data	active;
 
+	bool		invalid;
+	bool		data_ro;
+	bool		md_ro;
+
+	uint64_t	invalid_flags;
+	uint64_t	data_ro_flags;
+	uint64_t	md_ro_flags;
+
+	struct spdk_bs_dev *back_bs_dev;
+
 	/* TODO: The xattrs are mutable, but we don't want to be
 	 * copying them unecessarily. Figure this out.
 	 */
-	TAILQ_HEAD(, spdk_xattr) xattrs;
+	struct spdk_xattr_tailq xattrs;
+	struct spdk_xattr_tailq xattrs_internal;
 
 	TAILQ_ENTRY(spdk_blob) link;
+
+	uint32_t frozen_refcnt;
+	bool resize_in_progress;
 };
 
 struct spdk_blob_store {
 	uint64_t			md_start; /* Offset from beginning of disk, in pages */
 	uint32_t			md_len; /* Count, in pages */
 
-	struct {
-		uint32_t		max_md_ops;
-		struct spdk_io_channel	*md_channel;
-	} md_target;
+	struct spdk_io_channel		*md_channel;
+	uint32_t			max_channel_ops;
 
-	struct {
-		uint32_t		max_channel_ops;
-	} io_target;
-
+	struct spdk_thread		*md_thread;
 
 	struct spdk_bs_dev		*dev;
 
 	struct spdk_bit_array		*used_md_pages;
 	struct spdk_bit_array		*used_clusters;
+	struct spdk_bit_array		*used_blobids;
+
+	pthread_mutex_t			used_clusters_mutex;
 
 	uint32_t			cluster_sz;
 	uint64_t			total_clusters;
+	uint64_t			total_data_clusters;
 	uint64_t			num_free_clusters;
-	uint32_t			pages_per_cluster;
+	uint64_t			pages_per_cluster;
 
 	spdk_blob_id			super_blob;
+	struct spdk_bs_type		bstype;
 
-	TAILQ_HEAD(, spdk_blob) 	blobs;
+	struct spdk_bs_cpl		unload_cpl;
+	int				unload_err;
+
+	TAILQ_HEAD(, spdk_blob)		blobs;
+	TAILQ_HEAD(, spdk_blob_list)	snapshots;
+
+	bool                            clean;
 };
 
 struct spdk_bs_channel {
@@ -167,18 +195,43 @@ struct spdk_bs_channel {
 
 	struct spdk_bs_dev		*dev;
 	struct spdk_io_channel		*dev_channel;
+
+	TAILQ_HEAD(, spdk_bs_request_set) need_cluster_alloc;
+	TAILQ_HEAD(, spdk_bs_request_set) queued_io;
+};
+
+/** operation type */
+enum spdk_blob_op_type {
+	SPDK_BLOB_WRITE,
+	SPDK_BLOB_READ,
+	SPDK_BLOB_UNMAP,
+	SPDK_BLOB_WRITE_ZEROES,
+	SPDK_BLOB_WRITEV,
+	SPDK_BLOB_READV,
+};
+
+/* back bs_dev */
+
+#define BLOB_SNAPSHOT "SNAP"
+#define SNAPSHOT_IN_PROGRESS "SNAPTMP"
+
+struct spdk_blob_bs_dev {
+	struct spdk_bs_dev bs_dev;
+	struct spdk_blob *blob;
 };
 
 /* On-Disk Data Structures
  *
  * The following data structures exist on disk.
  */
-#define SPDK_BS_VERSION 1
+#define SPDK_BS_INITIAL_VERSION 1
+#define SPDK_BS_VERSION 3 /* current version */
 
 #pragma pack(push, 1)
 
 #define SPDK_MD_MASK_TYPE_USED_PAGES 0
 #define SPDK_MD_MASK_TYPE_USED_CLUSTERS 1
+#define SPDK_MD_MASK_TYPE_USED_BLOBIDS 2
 
 struct spdk_bs_md_mask {
 	uint8_t		type;
@@ -189,6 +242,8 @@ struct spdk_bs_md_mask {
 #define SPDK_MD_DESCRIPTOR_TYPE_PADDING 0
 #define SPDK_MD_DESCRIPTOR_TYPE_EXTENT 1
 #define SPDK_MD_DESCRIPTOR_TYPE_XATTR 2
+#define SPDK_MD_DESCRIPTOR_TYPE_FLAGS 3
+#define SPDK_MD_DESCRIPTOR_TYPE_XATTR_INTERNAL 4
 
 struct spdk_blob_md_descriptor_xattr {
 	uint8_t		type;
@@ -211,6 +266,37 @@ struct spdk_blob_md_descriptor_extent {
 	} extents[0];
 };
 
+#define SPDK_BLOB_THIN_PROV (1ULL << 0)
+#define SPDK_BLOB_INTERNAL_XATTR (1ULL << 1)
+#define SPDK_BLOB_INVALID_FLAGS_MASK	(SPDK_BLOB_THIN_PROV | SPDK_BLOB_INTERNAL_XATTR)
+
+#define SPDK_BLOB_READ_ONLY (1ULL << 0)
+#define SPDK_BLOB_DATA_RO_FLAGS_MASK	SPDK_BLOB_READ_ONLY
+#define SPDK_BLOB_MD_RO_FLAGS_MASK	0
+
+struct spdk_blob_md_descriptor_flags {
+	uint8_t		type;
+	uint32_t	length;
+
+	/*
+	 * If a flag in invalid_flags is set that the application is not aware of,
+	 *  it will not allow the blob to be opened.
+	 */
+	uint64_t	invalid_flags;
+
+	/*
+	 * If a flag in data_ro_flags is set that the application is not aware of,
+	 *  allow the blob to be opened in data_read_only and md_read_only mode.
+	 */
+	uint64_t	data_ro_flags;
+
+	/*
+	 * If a flag in md_ro_flags is set the the application is not aware of,
+	 *  allow the blob to be opened in md_read_only mode.
+	 */
+	uint64_t	md_ro_flags;
+};
+
 struct spdk_blob_md_descriptor {
 	uint8_t		type;
 	uint32_t	length;
@@ -230,7 +316,8 @@ struct spdk_blob_md_page {
 	uint32_t	next;
 	uint32_t	crc;
 };
-SPDK_STATIC_ASSERT(sizeof(struct spdk_blob_md_page) == 0x1000, "Invalid md page size");
+#define SPDK_BS_PAGE_SIZE 0x1000
+SPDK_STATIC_ASSERT(SPDK_BS_PAGE_SIZE == sizeof(struct spdk_blob_md_page), "Invalid md page size");
 
 #define SPDK_BS_SUPER_BLOCK_SIG "SPDKBLOB"
 
@@ -252,11 +339,20 @@ struct spdk_bs_super_block {
 	uint32_t	md_start; /* Offset from beginning of disk, in pages */
 	uint32_t	md_len; /* Count, in pages */
 
-	uint8_t		reserved[4040];
+	struct spdk_bs_type	bstype; /* blobstore type */
+
+	uint32_t	used_blobid_mask_start; /* Offset from beginning of disk, in pages */
+	uint32_t	used_blobid_mask_len; /* Count, in pages */
+
+	uint8_t		reserved[4012];
+	uint32_t	crc;
 };
 SPDK_STATIC_ASSERT(sizeof(struct spdk_bs_super_block) == 0x1000, "Invalid super block size");
 
 #pragma pack(pop)
+
+struct spdk_bs_dev *spdk_bs_create_zeroes_dev(void);
+struct spdk_bs_dev *spdk_bs_create_blob_bs_dev(struct spdk_blob *blob);
 
 /* Unit Conversions
  *
@@ -284,6 +380,14 @@ _spdk_bs_byte_to_lba(struct spdk_blob_store *bs, uint64_t length)
 }
 
 static inline uint64_t
+_spdk_bs_dev_byte_to_lba(struct spdk_bs_dev *bs_dev, uint64_t length)
+{
+	assert(length % bs_dev->blocklen == 0);
+
+	return length / bs_dev->blocklen;
+}
+
+static inline uint64_t
 _spdk_bs_lba_to_byte(struct spdk_blob_store *bs, uint64_t lba)
 {
 	return lba * bs->dev->blocklen;
@@ -292,15 +396,33 @@ _spdk_bs_lba_to_byte(struct spdk_blob_store *bs, uint64_t lba)
 static inline uint64_t
 _spdk_bs_page_to_lba(struct spdk_blob_store *bs, uint64_t page)
 {
-	return page * sizeof(struct spdk_blob_md_page) / bs->dev->blocklen;
+	return page * SPDK_BS_PAGE_SIZE / bs->dev->blocklen;
 }
 
-static inline uint32_t
+static inline uint64_t
+_spdk_bs_dev_page_to_lba(struct spdk_bs_dev *bs_dev, uint64_t page)
+{
+	return page * SPDK_BS_PAGE_SIZE / bs_dev->blocklen;
+}
+
+static inline uint64_t
 _spdk_bs_lba_to_page(struct spdk_blob_store *bs, uint64_t lba)
 {
 	uint64_t	lbas_per_page;
 
-	lbas_per_page = sizeof(struct spdk_blob_md_page) / bs->dev->blocklen;
+	lbas_per_page = SPDK_BS_PAGE_SIZE / bs->dev->blocklen;
+
+	assert(lba % lbas_per_page == 0);
+
+	return lba / lbas_per_page;
+}
+
+static inline uint64_t
+_spdk_bs_dev_lba_to_page(struct spdk_bs_dev *bs_dev, uint64_t lba)
+{
+	uint64_t	lbas_per_page;
+
+	lbas_per_page = SPDK_BS_PAGE_SIZE / bs_dev->blocklen;
 
 	assert(lba % lbas_per_page == 0);
 
@@ -310,7 +432,7 @@ _spdk_bs_lba_to_page(struct spdk_blob_store *bs, uint64_t lba)
 static inline uint64_t
 _spdk_bs_cluster_to_page(struct spdk_blob_store *bs, uint32_t cluster)
 {
-	return cluster * bs->pages_per_cluster;
+	return (uint64_t)cluster * bs->pages_per_cluster;
 }
 
 static inline uint32_t
@@ -324,7 +446,7 @@ _spdk_bs_page_to_cluster(struct spdk_blob_store *bs, uint64_t page)
 static inline uint64_t
 _spdk_bs_cluster_to_lba(struct spdk_blob_store *bs, uint32_t cluster)
 {
-	return cluster * (bs->cluster_sz / bs->dev->blocklen);
+	return (uint64_t)cluster * (bs->cluster_sz / bs->dev->blocklen);
 }
 
 static inline uint32_t
@@ -335,22 +457,47 @@ _spdk_bs_lba_to_cluster(struct spdk_blob_store *bs, uint64_t lba)
 	return lba / (bs->cluster_sz / bs->dev->blocklen);
 }
 
+static inline uint64_t
+_spdk_bs_blob_lba_to_back_dev_lba(struct spdk_blob *blob, uint64_t lba)
+{
+	return lba * blob->bs->dev->blocklen / blob->back_bs_dev->blocklen;
+}
+
+static inline uint64_t
+_spdk_bs_blob_lba_from_back_dev_lba(struct spdk_blob *blob, uint64_t lba)
+{
+	return lba * blob->back_bs_dev->blocklen / blob->bs->dev->blocklen;
+}
+
 /* End basic conversions */
 
-static inline uint32_t
+static inline uint64_t
 _spdk_bs_blobid_to_page(spdk_blob_id id)
 {
 	return id & 0xFFFFFFFF;
+}
+
+/* The blob id is a 64 bit number. The lower 32 bits are the page_idx. The upper
+ * 32 bits are not currently used. Stick a 1 there just to catch bugs where the
+ * code assumes blob id == page_idx.
+ */
+static inline spdk_blob_id
+_spdk_bs_page_to_blobid(uint64_t page_idx)
+{
+	if (page_idx > UINT32_MAX) {
+		return SPDK_BLOBID_INVALID;
+	}
+	return SPDK_BLOB_BLOBID_HIGH_BIT | page_idx;
 }
 
 /* Given a page offset into a blob, look up the LBA for the
  * start of that page.
  */
 static inline uint64_t
-_spdk_bs_blob_page_to_lba(struct spdk_blob *blob, uint32_t page)
+_spdk_bs_blob_page_to_lba(struct spdk_blob *blob, uint64_t page)
 {
 	uint64_t	lba;
-	uint32_t	pages_per_cluster;
+	uint64_t	pages_per_cluster;
 
 	pages_per_cluster = blob->bs->pages_per_cluster;
 
@@ -366,13 +513,45 @@ _spdk_bs_blob_page_to_lba(struct spdk_blob *blob, uint32_t page)
  * next cluster boundary.
  */
 static inline uint32_t
-_spdk_bs_num_pages_to_cluster_boundary(struct spdk_blob *blob, uint32_t page)
+_spdk_bs_num_pages_to_cluster_boundary(struct spdk_blob *blob, uint64_t page)
 {
-	uint32_t	pages_per_cluster;
+	uint64_t	pages_per_cluster;
 
 	pages_per_cluster = blob->bs->pages_per_cluster;
 
 	return pages_per_cluster - (page % pages_per_cluster);
+}
+
+/* Given a page offset into a blob, look up the number of pages into blob to beginning of current cluster */
+static inline uint32_t
+_spdk_bs_page_to_cluster_start(struct spdk_blob *blob, uint64_t page)
+{
+	uint64_t	pages_per_cluster;
+
+	pages_per_cluster = blob->bs->pages_per_cluster;
+
+	return page - (page % pages_per_cluster);
+}
+
+/* Given a page offset into a blob, look up if it is from allocated cluster. */
+static inline bool
+_spdk_bs_page_is_allocated(struct spdk_blob *blob, uint64_t page)
+{
+	uint64_t	lba;
+	uint64_t	pages_per_cluster;
+
+	pages_per_cluster = blob->bs->pages_per_cluster;
+
+	assert(page < blob->active.num_clusters * pages_per_cluster);
+
+	lba = blob->active.clusters[page / pages_per_cluster];
+
+	if (lba == 0) {
+		assert(spdk_blob_is_thin_provisioned(blob));
+		return false;
+	} else {
+		return true;
+	}
 }
 
 #endif

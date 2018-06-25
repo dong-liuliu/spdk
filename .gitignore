@@ -7,7 +7,6 @@
 *.kdev4
 *.ko
 *.log
-*.map
 *.o
 *.pyc
 *.so
@@ -26,3 +25,4 @@ CONFIG.local
 .cproject
 .settings
 mk/cc.mk
+PYTHON_COMMAND

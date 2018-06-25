@@ -32,6 +32,7 @@
  */
 
 #include "spdk/stdinc.h"
+#include "spdk/string.h"
 
 #include "spdk/log.h"
 #include "spdk/event.h"
@@ -48,10 +49,9 @@ int
 spdk_uevent_connect(void)
 {
 	struct sockaddr_nl addr;
-	int ret;
 	int netlink_fd;
 	int size = 64 * 1024;
-	int nonblock = 1;
+	int flag;
 
 	memset(&addr, 0, sizeof(addr));
 	addr.nl_family = AF_NETLINK;
@@ -59,14 +59,16 @@ spdk_uevent_connect(void)
 	addr.nl_groups = 0xffffffff;
 
 	netlink_fd = socket(PF_NETLINK, SOCK_DGRAM, NETLINK_KOBJECT_UEVENT);
-	if (netlink_fd < 0)
+	if (netlink_fd < 0) {
 		return -1;
+	}
 
 	setsockopt(netlink_fd, SOL_SOCKET, SO_RCVBUFFORCE, &size, sizeof(size));
 
-	ret = ioctl(netlink_fd, FIONBIO, &nonblock);
-	if (ret != 0) {
-		SPDK_ERRLOG("ioctl(FIONBIO) failed\n");
+	flag = fcntl(netlink_fd, F_GETFL);
+	if (fcntl(netlink_fd, F_SETFL, flag | O_NONBLOCK) < 0) {
+		SPDK_ERRLOG("fcntl can't set nonblocking mode for socket, fd: %d (%s)\n", netlink_fd,
+			    spdk_strerror(errno));
 		close(netlink_fd);
 		return -1;
 	}
@@ -91,10 +93,14 @@ parse_event(const char *buf, struct spdk_uevent *event)
 	char action[SPDK_UEVENT_MSG_LEN];
 	char subsystem[SPDK_UEVENT_MSG_LEN];
 	char dev_path[SPDK_UEVENT_MSG_LEN];
+	char driver[SPDK_UEVENT_MSG_LEN];
+	char vfio_pci_addr[SPDK_UEVENT_MSG_LEN];
 
 	memset(action, 0, SPDK_UEVENT_MSG_LEN);
 	memset(subsystem, 0, SPDK_UEVENT_MSG_LEN);
 	memset(dev_path, 0, SPDK_UEVENT_MSG_LEN);
+	memset(driver, 0, SPDK_UEVENT_MSG_LEN);
+	memset(vfio_pci_addr, 0, SPDK_UEVENT_MSG_LEN);
 
 	while (*buf) {
 		if (!strncmp(buf, "ACTION=", 7)) {
@@ -106,6 +112,12 @@ parse_event(const char *buf, struct spdk_uevent *event)
 		} else if (!strncmp(buf, "SUBSYSTEM=", 10)) {
 			buf += 10;
 			snprintf(subsystem, sizeof(subsystem), "%s", buf);
+		} else if (!strncmp(buf, "DRIVER=", 7)) {
+			buf += 7;
+			snprintf(driver, sizeof(driver), "%s", buf);
+		} else if (!strncmp(buf, "PCI_SLOT_NAME=", 14)) {
+			buf += 14;
+			snprintf(vfio_pci_addr, sizeof(vfio_pci_addr), "%s", buf);
 		}
 		while (*buf++)
 			;
@@ -135,6 +147,24 @@ parse_event(const char *buf, struct spdk_uevent *event)
 		spdk_pci_addr_fmt(event->traddr, sizeof(event->traddr), &pci_addr);
 		return 1;
 	}
+	if (!strncmp(driver, "vfio-pci", 8)) {
+		struct spdk_pci_addr pci_addr;
+
+		event->subsystem = SPDK_NVME_UEVENT_SUBSYSTEM_VFIO;
+		if (!strncmp(action, "add", 3)) {
+			event->action = SPDK_NVME_UEVENT_ADD;
+		}
+		if (!strncmp(action, "remove", 6)) {
+			event->action = SPDK_NVME_UEVENT_REMOVE;
+		}
+		if (spdk_pci_addr_parse(&pci_addr, vfio_pci_addr) != 0) {
+			SPDK_ERRLOG("Invalid format for NVMe BDF: %s\n", vfio_pci_addr);
+			return -1;
+		}
+		spdk_pci_addr_fmt(event->traddr, sizeof(event->traddr), &pci_addr);
+		return 1;
+
+	}
 	return -1;
 }
 
@@ -156,7 +186,7 @@ spdk_get_uevent(int fd, struct spdk_uevent *uevent)
 		if (errno == EAGAIN || errno == EWOULDBLOCK) {
 			return 0;
 		} else {
-			SPDK_ERRLOG("Socket read error(%d): %s\n", errno, strerror(errno));
+			SPDK_ERRLOG("Socket read error(%d): %s\n", errno, spdk_strerror(errno));
 			return -1;
 		}
 	}

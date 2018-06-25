@@ -31,7 +31,10 @@
  *   OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 
-#include "env_posix.cc"
+#include "rocksdb/env.h"
+#include <set>
+#include <iostream>
+#include <stdexcept>
 
 extern "C" {
 #include "spdk/env.h"
@@ -40,7 +43,7 @@ extern "C" {
 #include "spdk/blobfs.h"
 #include "spdk/blob_bdev.h"
 #include "spdk/log.h"
-#include "spdk/io_channel.h"
+#include "spdk/thread.h"
 #include "spdk/bdev.h"
 }
 
@@ -49,8 +52,10 @@ namespace rocksdb
 
 struct spdk_filesystem *g_fs = NULL;
 struct spdk_bs_dev *g_bs_dev;
+uint32_t g_lcore = 0;
 std::string g_bdev_name;
 volatile bool g_spdk_ready = false;
+volatile bool g_spdk_start_failure = false;
 struct sync_args {
 	struct spdk_io_channel *channel;
 };
@@ -71,8 +76,40 @@ __send_request(fs_request_fn fn, void *arg)
 {
 	struct spdk_event *event;
 
-	event = spdk_event_allocate(0, __call_fn, (void *)fn, arg);
+	event = spdk_event_allocate(g_lcore, __call_fn, (void *)fn, arg);
 	spdk_event_call(event);
+}
+
+static std::string
+sanitize_path(const std::string &input, const std::string &mount_directory)
+{
+	int index = 0;
+	std::string name;
+	std::string input_tmp;
+
+	input_tmp = input.substr(mount_directory.length(), input.length());
+	for (const char &c : input_tmp) {
+		if (index == 0) {
+			if (c != '/') {
+				name = name.insert(index, 1, '/');
+				index++;
+			}
+			name = name.insert(index, 1, c);
+			index++;
+		} else {
+			if (name[index - 1] == '/' && c == '/') {
+				continue;
+			} else {
+				name = name.insert(index, 1, c);
+				index++;
+			}
+		}
+	}
+
+	if (name[name.size() - 1] == '/') {
+		name = name.erase(name.size() - 1, 1);
+	}
+	return name;
 }
 
 class SpdkSequentialFile : public SequentialFile
@@ -87,12 +124,6 @@ public:
 	virtual Status Skip(uint64_t n) override;
 	virtual Status InvalidateCache(size_t offset, size_t length) override;
 };
-
-static std::string
-basename(std::string full)
-{
-	return full.substr(full.rfind("/") + 1);
-}
 
 SpdkSequentialFile::~SpdkSequentialFile(void)
 {
@@ -127,17 +158,12 @@ class SpdkRandomAccessFile : public RandomAccessFile
 {
 	struct spdk_file *mFile;
 public:
-	SpdkRandomAccessFile(const std::string &fname, const EnvOptions &options);
+	SpdkRandomAccessFile(struct spdk_file *file) : mFile(file) {}
 	virtual ~SpdkRandomAccessFile();
 
 	virtual Status Read(uint64_t offset, size_t n, Slice *result, char *scratch) const override;
 	virtual Status InvalidateCache(size_t offset, size_t length) override;
 };
-
-SpdkRandomAccessFile::SpdkRandomAccessFile(const std::string &fname, const EnvOptions &options)
-{
-	spdk_fs_open_file(g_fs, g_sync_args.channel, fname.c_str(), SPDK_BLOBFS_OPEN_CREATE, &mFile);
-}
 
 SpdkRandomAccessFile::~SpdkRandomAccessFile(void)
 {
@@ -161,10 +187,10 @@ SpdkRandomAccessFile::InvalidateCache(size_t offset, size_t length)
 class SpdkWritableFile : public WritableFile
 {
 	struct spdk_file *mFile;
-	uint32_t mSize;
+	uint64_t mSize;
 
 public:
-	SpdkWritableFile(const std::string &fname, const EnvOptions &options);
+	SpdkWritableFile(struct spdk_file *file) : mFile(file), mSize(0) {}
 	~SpdkWritableFile()
 	{
 		if (mFile != NULL) {
@@ -218,7 +244,6 @@ public:
 	{
 		return Status::OK();
 	}
-#ifdef ROCKSDB_FALLOCATE_PRESENT
 	virtual Status Allocate(uint64_t offset, uint64_t len) override
 	{
 		spdk_file_truncate(mFile, g_sync_args.channel, offset + len);
@@ -237,13 +262,7 @@ public:
 	{
 		return 0;
 	}
-#endif
 };
-
-SpdkWritableFile::SpdkWritableFile(const std::string &fname, const EnvOptions &options) : mSize(0)
-{
-	spdk_fs_open_file(g_fs, g_sync_args.channel, fname.c_str(), SPDK_BLOBFS_OPEN_CREATE, &mFile);
-}
 
 Status
 SpdkWritableFile::Append(const Slice &data)
@@ -265,7 +284,13 @@ public:
 	}
 };
 
-class SpdkEnv : public PosixEnv
+class SpdkAppStartException : public std::runtime_error
+{
+public:
+	SpdkAppStartException(std::string mess): std::runtime_error(mess) {}
+};
+
+class SpdkEnv : public EnvWrapper
 {
 private:
 	pthread_t mSpdkTid;
@@ -274,7 +299,7 @@ private:
 	std::string mBdev;
 
 public:
-	SpdkEnv(const std::string &dir, const std::string &conf,
+	SpdkEnv(Env *base_env, const std::string &dir, const std::string &conf,
 		const std::string &bdev, uint64_t cache_size_in_mb);
 
 	virtual ~SpdkEnv();
@@ -287,16 +312,22 @@ public:
 			struct spdk_file *file;
 			int rc;
 
+			std::string name = sanitize_path(fname, mDirectory);
 			rc = spdk_fs_open_file(g_fs, g_sync_args.channel,
-					       basename(fname).c_str(), 0, &file);
+					       name.c_str(), 0, &file);
 			if (rc == 0) {
 				result->reset(new SpdkSequentialFile(file));
 				return Status::OK();
 			} else {
-				return IOError(fname, rc);
+				/* Myrocks engine uses errno(ENOENT) as one
+				 * special condition, for the purpose to
+				 * support MySQL, set the errno to right value.
+				 */
+				errno = -rc;
+				return Status::IOError(name, strerror(errno));
 			}
 		} else {
-			return PosixEnv::NewSequentialFile(fname, result, options);
+			return EnvWrapper::NewSequentialFile(fname, result, options);
 		}
 	}
 
@@ -305,10 +336,21 @@ public:
 					   const EnvOptions &options) override
 	{
 		if (fname.compare(0, mDirectory.length(), mDirectory) == 0) {
-			result->reset(new SpdkRandomAccessFile(basename(fname), options));
-			return Status::OK();
+			std::string name = sanitize_path(fname, mDirectory);
+			struct spdk_file *file;
+			int rc;
+
+			rc = spdk_fs_open_file(g_fs, g_sync_args.channel,
+					       name.c_str(), 0, &file);
+			if (rc == 0) {
+				result->reset(new SpdkRandomAccessFile(file));
+				return Status::OK();
+			} else {
+				errno = -rc;
+				return Status::IOError(name, strerror(errno));
+			}
 		} else {
-			return PosixEnv::NewRandomAccessFile(fname, result, options);
+			return EnvWrapper::NewRandomAccessFile(fname, result, options);
 		}
 	}
 
@@ -317,10 +359,21 @@ public:
 				       const EnvOptions &options) override
 	{
 		if (fname.compare(0, mDirectory.length(), mDirectory) == 0) {
-			result->reset(new SpdkWritableFile(basename(fname), options));
-			return Status::OK();
+			std::string name = sanitize_path(fname, mDirectory);
+			struct spdk_file *file;
+			int rc;
+
+			rc = spdk_fs_open_file(g_fs, g_sync_args.channel, name.c_str(),
+					       SPDK_BLOBFS_OPEN_CREATE, &file);
+			if (rc == 0) {
+				result->reset(new SpdkWritableFile(file));
+				return Status::OK();
+			} else {
+				errno = -rc;
+				return Status::IOError(name, strerror(errno));
+			}
 		} else {
-			return PosixEnv::NewWritableFile(fname, result, options);
+			return EnvWrapper::NewWritableFile(fname, result, options);
 		}
 	}
 
@@ -329,7 +382,7 @@ public:
 					 unique_ptr<WritableFile> *result,
 					 const EnvOptions &options) override
 	{
-		return PosixEnv::ReuseWritableFile(fname, old_fname, result, options);
+		return EnvWrapper::ReuseWritableFile(fname, old_fname, result, options);
 	}
 
 	virtual Status NewDirectory(const std::string &name,
@@ -341,41 +394,41 @@ public:
 	virtual Status FileExists(const std::string &fname) override
 	{
 		struct spdk_file_stat stat;
-		std::string fname_base = basename(fname);
 		int rc;
+		std::string name = sanitize_path(fname, mDirectory);
 
-		rc = spdk_fs_file_stat(g_fs, g_sync_args.channel, fname_base.c_str(), &stat);
+		rc = spdk_fs_file_stat(g_fs, g_sync_args.channel, name.c_str(), &stat);
 		if (rc == 0) {
 			return Status::OK();
 		}
-		return PosixEnv::FileExists(fname);
+		return EnvWrapper::FileExists(fname);
 	}
-	virtual Status RenameFile(const std::string &src, const std::string &target) override
+	virtual Status RenameFile(const std::string &src, const std::string &t) override
 	{
-		std::string target_base = basename(target);
-		std::string src_base = basename(src);
 		int rc;
+		std::string src_name = sanitize_path(src, mDirectory);
+		std::string target_name = sanitize_path(t, mDirectory);
 
 		rc = spdk_fs_rename_file(g_fs, g_sync_args.channel,
-					 src_base.c_str(), target_base.c_str());
+					 src_name.c_str(), target_name.c_str());
 		if (rc == -ENOENT) {
-			return PosixEnv::RenameFile(src, target);
+			return EnvWrapper::RenameFile(src, t);
 		}
 		return Status::OK();
 	}
-	virtual Status LinkFile(const std::string &src, const std::string &target) override
+	virtual Status LinkFile(const std::string &src, const std::string &t) override
 	{
 		return Status::NotSupported("SpdkEnv does not support LinkFile");
 	}
 	virtual Status GetFileSize(const std::string &fname, uint64_t *size) override
 	{
 		struct spdk_file_stat stat;
-		std::string fname_base = basename(fname);
 		int rc;
+		std::string name = sanitize_path(fname, mDirectory);
 
-		rc = spdk_fs_file_stat(g_fs, g_sync_args.channel, fname_base.c_str(), &stat);
+		rc = spdk_fs_file_stat(g_fs, g_sync_args.channel, name.c_str(), &stat);
 		if (rc == -ENOENT) {
-			return PosixEnv::GetFileSize(fname, size);
+			return EnvWrapper::GetFileSize(fname, size);
 		}
 		*size = stat.size;
 		return Status::OK();
@@ -383,17 +436,20 @@ public:
 	virtual Status DeleteFile(const std::string &fname) override
 	{
 		int rc;
-		std::string fname_base = basename(fname);
-		rc = spdk_fs_delete_file(g_fs, g_sync_args.channel, fname_base.c_str());
+		std::string name = sanitize_path(fname, mDirectory);
+
+		rc = spdk_fs_delete_file(g_fs, g_sync_args.channel, name.c_str());
 		if (rc == -ENOENT) {
-			return PosixEnv::DeleteFile(fname);
+			return EnvWrapper::DeleteFile(fname);
 		}
 		return Status::OK();
 	}
 	virtual void StartThread(void (*function)(void *arg), void *arg) override;
 	virtual Status LockFile(const std::string &fname, FileLock **lock) override
 	{
-		spdk_fs_open_file(g_fs, g_sync_args.channel, basename(fname).c_str(),
+		std::string name = sanitize_path(fname, mDirectory);
+
+		spdk_fs_open_file(g_fs, g_sync_args.channel, name.c_str(),
 				  SPDK_BLOBFS_OPEN_CREATE, (struct spdk_file **)lock);
 		return Status::OK();
 	}
@@ -405,22 +461,49 @@ public:
 	virtual Status GetChildren(const std::string &dir,
 				   std::vector<std::string> *result) override
 	{
+		std::string::size_type pos;
+		std::set<std::string> dir_and_file_set;
+		std::string full_path;
+		std::string filename;
+		std::string dir_name;
+
 		if (dir.find("archive") != std::string::npos) {
 			return Status::OK();
 		}
 		if (dir.compare(0, mDirectory.length(), mDirectory) == 0) {
 			spdk_fs_iter iter;
 			struct spdk_file *file;
+			dir_name = sanitize_path(dir, mDirectory);
 
 			iter = spdk_fs_iter_first(g_fs);
 			while (iter != NULL) {
 				file = spdk_fs_iter_get_file(iter);
-				result->push_back(std::string(spdk_file_get_name(file)));
+				full_path = spdk_file_get_name(file);
+				if (strncmp(dir_name.c_str(), full_path.c_str(), dir_name.length())) {
+					iter = spdk_fs_iter_next(iter);
+					continue;
+				}
+				pos = full_path.find("/", dir_name.length() + 1);
+
+				if (pos != std::string::npos) {
+					filename = full_path.substr(dir_name.length() + 1, pos - dir_name.length() - 1);
+				} else {
+					filename = full_path.substr(dir_name.length() + 1);
+				}
+				dir_and_file_set.insert(filename);
 				iter = spdk_fs_iter_next(iter);
 			}
+
+			for (auto &s : dir_and_file_set) {
+				result->push_back(s);
+			}
+
+			result->push_back(".");
+			result->push_back("..");
+
 			return Status::OK();
 		}
-		return PosixEnv::GetChildren(dir, result);
+		return EnvWrapper::GetChildren(dir, result);
 	}
 };
 
@@ -434,25 +517,32 @@ _spdk_send_msg(spdk_thread_fn fn, void *ctx, void *thread_ctx)
 void SpdkInitializeThread(void)
 {
 	if (g_fs != NULL) {
-		spdk_allocate_thread(_spdk_send_msg, NULL);
+		/* TODO: Add an event lib call to dynamically register a thread */
+		spdk_allocate_thread(_spdk_send_msg, NULL, NULL, NULL, "spdk_rocksdb");
 		g_sync_args.channel = spdk_fs_alloc_io_channel_sync(g_fs);
 	}
 }
 
+struct SpdkThreadState {
+	void (*user_function)(void *);
+	void *arg;
+};
+
 static void SpdkStartThreadWrapper(void *arg)
 {
-	StartThreadState *state = reinterpret_cast<StartThreadState *>(arg);
+	SpdkThreadState *state = reinterpret_cast<SpdkThreadState *>(arg);
 
 	SpdkInitializeThread();
-	StartThreadWrapper(state);
+	state->user_function(state->arg);
+	delete state;
 }
 
 void SpdkEnv::StartThread(void (*function)(void *arg), void *arg)
 {
-	StartThreadState *state = new StartThreadState;
+	SpdkThreadState *state = new SpdkThreadState;
 	state->user_function = function;
 	state->arg = arg;
-	PosixEnv::StartThread(SpdkStartThreadWrapper, state);
+	EnvWrapper::StartThread(SpdkStartThreadWrapper, state);
 }
 
 static void
@@ -469,7 +559,6 @@ spdk_rocksdb_run(void *arg1, void *arg2)
 {
 	struct spdk_bdev *bdev;
 
-	pthread_setname_np(pthread_self(), "spdk");
 	bdev = spdk_bdev_get_by_name(g_bdev_name.c_str());
 
 	if (bdev == NULL) {
@@ -477,7 +566,9 @@ spdk_rocksdb_run(void *arg1, void *arg2)
 		exit(1);
 	}
 
-	g_bs_dev = spdk_bdev_create_bs_dev(bdev);
+	g_lcore = spdk_env_get_first_core();
+
+	g_bs_dev = spdk_bdev_create_bs_dev(bdev, NULL, NULL);
 	printf("using bdev %s\n", g_bdev_name.c_str());
 	spdk_fs_load(g_bs_dev, __send_request, fs_load_cb, NULL);
 }
@@ -504,24 +595,36 @@ static void *
 initialize_spdk(void *arg)
 {
 	struct spdk_app_opts *opts = (struct spdk_app_opts *)arg;
+	int rc;
 
-	spdk_app_start(opts, spdk_rocksdb_run, NULL, NULL);
-	spdk_app_fini();
-
-	delete opts;
+	rc = spdk_app_start(opts, spdk_rocksdb_run, NULL, NULL);
+	/*
+	 * TODO:  Revisit for case of internal failure of
+	 * spdk_app_start(), itself.  At this time, it's known
+	 * the only application's use of spdk_app_stop() passes
+	 * a zero; i.e. no fail (non-zero) cases so here we
+	 * assume there was an internal failure and flag it
+	 * so we can throw an exception.
+	 */
+	if (rc) {
+		g_spdk_start_failure = true;
+	} else {
+		spdk_app_fini();
+		delete opts;
+	}
 	pthread_exit(NULL);
+
 }
 
-SpdkEnv::SpdkEnv(const std::string &dir, const std::string &conf,
+SpdkEnv::SpdkEnv(Env *base_env, const std::string &dir, const std::string &conf,
 		 const std::string &bdev, uint64_t cache_size_in_mb)
-	: PosixEnv(), mDirectory(dir), mConfig(conf), mBdev(bdev)
+	: EnvWrapper(base_env), mDirectory(dir), mConfig(conf), mBdev(bdev)
 {
 	struct spdk_app_opts *opts = new struct spdk_app_opts;
 
 	spdk_app_opts_init(opts);
 	opts->name = "rocksdb";
 	opts->config_file = mConfig.c_str();
-	opts->reactor_mask = "0x1";
 	opts->mem_size = 1024 + cache_size_in_mb;
 	opts->shutdown_cb = spdk_rocksdb_shutdown;
 
@@ -529,28 +632,57 @@ SpdkEnv::SpdkEnv(const std::string &dir, const std::string &conf,
 	g_bdev_name = mBdev;
 
 	pthread_create(&mSpdkTid, NULL, &initialize_spdk, opts);
-	while (!g_spdk_ready)
+	while (!g_spdk_ready && !g_spdk_start_failure)
 		;
+	if (g_spdk_start_failure) {
+		delete opts;
+		throw SpdkAppStartException("spdk_app_start() unable to start spdk_rocksdb_run()");
+	}
 
 	SpdkInitializeThread();
 }
 
 SpdkEnv::~SpdkEnv()
 {
+	/* This is a workaround for rocksdb test, we close the files if the rocksdb not
+	 * do the work before the test quit.
+	 */
+	if (g_fs != NULL) {
+		spdk_fs_iter iter;
+		struct spdk_file *file;
+
+		if (!g_sync_args.channel) {
+			SpdkInitializeThread();
+		}
+		iter = spdk_fs_iter_first(g_fs);
+		while (iter != NULL) {
+			file = spdk_fs_iter_get_file(iter);
+			spdk_file_close(file, g_sync_args.channel);
+			iter = spdk_fs_iter_next(iter);
+		}
+	}
+
 	spdk_app_start_shutdown();
 	pthread_join(mSpdkTid, NULL);
 }
 
-void NewSpdkEnv(Env **env, const std::string &dir, const std::string &conf,
+Env *NewSpdkEnv(Env *base_env, const std::string &dir, const std::string &conf,
 		const std::string &bdev, uint64_t cache_size_in_mb)
 {
-	SpdkEnv *spdk_env = new SpdkEnv(dir, conf, bdev, cache_size_in_mb);
-
-	if (g_fs != NULL) {
-		*env = spdk_env;
-	} else {
-		*env = NULL;
-		delete spdk_env;
+	try {
+		SpdkEnv *spdk_env = new SpdkEnv(base_env, dir, conf, bdev, cache_size_in_mb);
+		if (g_fs != NULL) {
+			return spdk_env;
+		} else {
+			delete spdk_env;
+			return NULL;
+		}
+	} catch (SpdkAppStartException &e) {
+		SPDK_ERRLOG("NewSpdkEnv: exception caught: %s", e.what());
+		return NULL;
+	} catch (...) {
+		SPDK_ERRLOG("NewSpdkEnv: default exception caught");
+		return NULL;
 	}
 }
 

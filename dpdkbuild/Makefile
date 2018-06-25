@@ -34,9 +34,13 @@
 SPDK_ROOT_DIR := $(abspath $(CURDIR)/..)
 include $(SPDK_ROOT_DIR)/mk/spdk.common.mk
 
-.PHONY: all clean
+.PHONY: all clean install
 
+ifeq ($(TARGET_MACHINE),aarch64)
+DPDK_CONFIG := arm64-armv8a
+else
 DPDK_CONFIG := spdk
+endif
 
 ifeq ($(OS),Linux)
 DPDK_CONFIG := $(DPDK_CONFIG)-linuxapp
@@ -54,9 +58,7 @@ else
 DPDK_CONFIG := $(DPDK_CONFIG)-gcc
 endif
 
-ifeq ($(CONFIG_FIO_PLUGIN),y)
 DPDK_CFLAGS = -fPIC
-endif
 
 ifeq ($(CONFIG_DEBUG),y)
 DPDK_CFLAGS += -O0 -g
@@ -76,3 +78,5 @@ all: $(SPDK_ROOT_DIR)/dpdk/build
 
 clean:
 	$(Q)rm -rf $(SPDK_ROOT_DIR)/dpdk/build
+
+install: all

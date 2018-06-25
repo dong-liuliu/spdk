@@ -35,7 +35,7 @@
 
 #include "spdk_cunit.h"
 
-#include "string.c"
+#include "util/string.c"
 
 static void
 test_parse_ip_addr(void)
@@ -95,6 +95,113 @@ test_parse_ip_addr(void)
 	CU_ASSERT_EQUAL(port, NULL);
 }
 
+static void
+test_str_chomp(void)
+{
+	char s[1024];
+
+	/* One \n newline */
+	snprintf(s, sizeof(s), "%s", "hello world\n");
+	CU_ASSERT(spdk_str_chomp(s) == 1);
+	CU_ASSERT(strcmp(s, "hello world") == 0);
+
+	/* One \r\n newline */
+	snprintf(s, sizeof(s), "%s", "hello world\r\n");
+	CU_ASSERT(spdk_str_chomp(s) == 2);
+	CU_ASSERT(strcmp(s, "hello world") == 0);
+
+	/* No newlines */
+	snprintf(s, sizeof(s), "%s", "hello world");
+	CU_ASSERT(spdk_str_chomp(s) == 0);
+	CU_ASSERT(strcmp(s, "hello world") == 0);
+
+	/* Two newlines */
+	snprintf(s, sizeof(s), "%s", "hello world\n\n");
+	CU_ASSERT(spdk_str_chomp(s) == 2);
+	CU_ASSERT(strcmp(s, "hello world") == 0);
+
+	/* Empty string */
+	snprintf(s, sizeof(s), "%s", "");
+	CU_ASSERT(spdk_str_chomp(s) == 0);
+	CU_ASSERT(strcmp(s, "") == 0);
+
+	/* One-character string with only \n */
+	snprintf(s, sizeof(s), "%s", "\n");
+	CU_ASSERT(spdk_str_chomp(s) == 1);
+	CU_ASSERT(strcmp(s, "") == 0);
+
+	/* One-character string without a newline */
+	snprintf(s, sizeof(s), "%s", "a");
+	CU_ASSERT(spdk_str_chomp(s) == 0);
+	CU_ASSERT(strcmp(s, "a") == 0);
+}
+
+static void
+test_parse_capacity(void)
+{
+	char str[128];
+	uint64_t cap;
+	int rc;
+	bool has_prefix;
+
+	rc = spdk_parse_capacity("472", &cap, &has_prefix);
+	CU_ASSERT(rc == 0);
+	CU_ASSERT(cap == 472);
+	CU_ASSERT(has_prefix == false);
+
+	snprintf(str, sizeof(str), "%"PRIu64, UINT64_MAX);
+	rc = spdk_parse_capacity(str, &cap, &has_prefix);
+	CU_ASSERT(rc == 0);
+	CU_ASSERT(cap == UINT64_MAX);
+	CU_ASSERT(has_prefix == false);
+
+	rc = spdk_parse_capacity("12k", &cap, &has_prefix);
+	CU_ASSERT(rc == 0);
+	CU_ASSERT(cap == 12 * 1024);
+	CU_ASSERT(has_prefix == true);
+
+	rc = spdk_parse_capacity("12K", &cap, &has_prefix);
+	CU_ASSERT(rc == 0);
+	CU_ASSERT(cap == 12 * 1024);
+	CU_ASSERT(has_prefix == true);
+
+	rc = spdk_parse_capacity("12KB", &cap, &has_prefix);
+	CU_ASSERT(rc == 0);
+	CU_ASSERT(cap == 12 * 1024);
+	CU_ASSERT(has_prefix == true);
+
+	rc = spdk_parse_capacity("100M", &cap, &has_prefix);
+	CU_ASSERT(rc == 0);
+	CU_ASSERT(cap == 100 * 1024 * 1024);
+	CU_ASSERT(has_prefix == true);
+
+	rc = spdk_parse_capacity("128M", &cap, &has_prefix);
+	CU_ASSERT(rc == 0);
+	CU_ASSERT(cap == 128 * 1024 * 1024);
+	CU_ASSERT(has_prefix == true);
+
+	rc = spdk_parse_capacity("4G", &cap, &has_prefix);
+	CU_ASSERT(rc == 0);
+	CU_ASSERT(cap == 4ULL * 1024 * 1024 * 1024);
+	CU_ASSERT(has_prefix == true);
+
+	rc = spdk_parse_capacity("100M 512k", &cap, &has_prefix);
+	CU_ASSERT(rc == 0);
+	CU_ASSERT(cap == 100ULL * 1024 * 1024);
+
+	rc = spdk_parse_capacity("12k8K", &cap, &has_prefix);
+	CU_ASSERT(rc == 0);
+	CU_ASSERT(cap == 12 * 1024);
+	CU_ASSERT(has_prefix == true);
+
+	/* Non-number */
+	rc = spdk_parse_capacity("G", &cap, &has_prefix);
+	CU_ASSERT(rc != 0);
+
+	rc = spdk_parse_capacity("darsto", &cap, &has_prefix);
+	CU_ASSERT(rc != 0);
+}
+
 int
 main(int argc, char **argv)
 {
@@ -112,7 +219,9 @@ main(int argc, char **argv)
 	}
 
 	if (
-		CU_add_test(suite, "test_parse_ip_addr", test_parse_ip_addr) == NULL) {
+		CU_add_test(suite, "test_parse_ip_addr", test_parse_ip_addr) == NULL ||
+		CU_add_test(suite, "test_str_chomp", test_str_chomp) == NULL ||
+		CU_add_test(suite, "test_parse_capacity", test_parse_capacity) == NULL) {
 		CU_cleanup_registry();
 		return CU_get_error();
 	}

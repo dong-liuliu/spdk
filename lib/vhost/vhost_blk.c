@@ -36,27 +36,30 @@
 #include "spdk/env.h"
 #include "spdk/bdev.h"
 #include "spdk/conf.h"
-#include "spdk/io_channel.h"
+#include "spdk/thread.h"
 #include "spdk/likely.h"
 #include "spdk/string.h"
 #include "spdk/util.h"
 #include "spdk/vhost.h"
 
 #include "vhost_internal.h"
-#include "vhost_iommu.h"
-
-#define VHOST_BLK_IOVS_MAX 128
 
 struct spdk_vhost_blk_task {
 	struct spdk_bdev_io *bdev_io;
 	struct spdk_vhost_blk_dev *bvdev;
+	struct spdk_vhost_virtqueue *vq;
+
 	volatile uint8_t *status;
 
 	uint16_t req_idx;
 
-	uint32_t length;
+	/* If set, the task is currently used for I/O processing. */
+	bool used;
+
+	/** Number of bytes that were written. */
+	uint32_t used_len;
 	uint16_t iovcnt;
-	struct iovec iovs[VHOST_BLK_IOVS_MAX];
+	struct iovec iovs[SPDK_VHOST_IOVS_MAX];
 };
 
 struct spdk_vhost_blk_dev {
@@ -65,52 +68,31 @@ struct spdk_vhost_blk_dev {
 	struct spdk_bdev_desc *bdev_desc;
 	struct spdk_io_channel *bdev_io_channel;
 	struct spdk_poller *requestq_poller;
-	struct spdk_ring *tasks_pool;
 	bool readonly;
 };
 
-static void
-spdk_vhost_blk_get_tasks(struct spdk_vhost_blk_dev *bvdev, struct spdk_vhost_blk_task **tasks,
-			 size_t count)
-{
-	size_t res_count;
-
-	bvdev->vdev.task_cnt += count;
-	res_count = spdk_ring_dequeue(bvdev->tasks_pool, (void **)tasks, count);
-
-	/* Allocated task count in init function is equal queue depth so dequeue must not fail. */
-	assert(res_count == count);
-
-	for (res_count = 0; res_count < count; res_count++) {
-		SPDK_TRACELOG(SPDK_TRACE_VHOST_BLK_TASK, "GET task %p\n", tasks[res_count]);
-	}
-}
+/* forward declaration */
+static const struct spdk_vhost_dev_backend vhost_blk_device_backend;
 
 static void
-spdk_vhost_blk_put_tasks(struct spdk_vhost_blk_dev *bvdev, struct spdk_vhost_blk_task **tasks,
-			 size_t count)
+blk_task_finish(struct spdk_vhost_blk_task *task)
 {
-	size_t res_count;
-
-	for (res_count = 0; res_count < count; res_count++) {
-		SPDK_TRACELOG(SPDK_TRACE_VHOST_BLK_TASK, "PUT task %p\n", tasks[res_count]);
-	}
-
-	res_count = spdk_ring_enqueue(bvdev->tasks_pool, (void **)tasks, count);
-
-	/* Allocated task count in init function is equal queue depth so enqueue must not fail. */
-	assert(res_count == count);
-	bvdev->vdev.task_cnt -= count;
+	assert(task->bvdev->vdev.task_cnt > 0);
+	task->bvdev->vdev.task_cnt--;
+	task->used = false;
 }
 
 static void
 invalid_blk_request(struct spdk_vhost_blk_task *task, uint8_t status)
 {
-	*task->status = status;
-	spdk_vhost_vq_used_ring_enqueue(&task->bvdev->vdev, &task->bvdev->vdev.virtqueue[0], task->req_idx,
-					0);
-	spdk_vhost_blk_put_tasks(task->bvdev, &task, 1);
-	SPDK_TRACELOG(SPDK_TRACE_VHOST_BLK_DATA, "Invalid request (status=%" PRIu8")\n", status);
+	if (task->status) {
+		*task->status = status;
+	}
+
+	spdk_vhost_vq_used_ring_enqueue(&task->bvdev->vdev, task->vq, task->req_idx,
+					task->used_len);
+	blk_task_finish(task);
+	SPDK_DEBUGLOG(SPDK_LOG_VHOST_BLK_DATA, "Invalid request (status=%" PRIu8")\n", status);
 }
 
 /*
@@ -121,12 +103,19 @@ invalid_blk_request(struct spdk_vhost_blk_task *task, uint8_t status)
  *   FIXME: Make this function return to rd_cnt and wr_cnt
  */
 static int
-blk_iovs_setup(struct spdk_vhost_dev *vdev, struct rte_vhost_vring *vq, uint16_t req_idx,
+blk_iovs_setup(struct spdk_vhost_dev *vdev, struct spdk_vhost_virtqueue *vq, uint16_t req_idx,
 	       struct iovec *iovs, uint16_t *iovs_cnt, uint32_t *length)
 {
-	struct vring_desc *desc = spdk_vhost_vq_get_desc(vq, req_idx);
+	struct vring_desc *desc, *desc_table;
 	uint16_t out_cnt = 0, cnt = 0;
-	uint32_t len = 0;
+	uint32_t desc_table_size, len = 0;
+	int rc;
+
+	rc = spdk_vhost_vq_get_desc(vdev, vq, req_idx, &desc, &desc_table, &desc_table_size);
+	if (rc != 0) {
+		SPDK_ERRLOG("%s: Invalid descriptor at index %"PRIu16".\n", vdev->name, req_idx);
+		return -1;
+	}
 
 	while (1) {
 		/*
@@ -134,25 +123,27 @@ blk_iovs_setup(struct spdk_vhost_dev *vdev, struct rte_vhost_vring *vq, uint16_t
 		 * Should not happen if request is well formatted, otherwise this is a BUG.
 		 */
 		if (spdk_unlikely(cnt == *iovs_cnt)) {
-			SPDK_TRACELOG(SPDK_TRACE_VHOST_BLK, "Max IOVs in request reached (req_idx = %"PRIu16").\n",
+			SPDK_DEBUGLOG(SPDK_LOG_VHOST_BLK, "Max IOVs in request reached (req_idx = %"PRIu16").\n",
 				      req_idx);
 			return -1;
 		}
 
-		if (spdk_unlikely(spdk_vhost_vring_desc_to_iov(vdev, &iovs[cnt], desc))) {
-			SPDK_TRACELOG(SPDK_TRACE_VHOST_BLK, "Invalid descriptor %" PRIu16" (req_idx = %"PRIu16").\n",
+		if (spdk_unlikely(spdk_vhost_vring_desc_to_iov(vdev, iovs, &cnt, desc))) {
+			SPDK_DEBUGLOG(SPDK_LOG_VHOST_BLK, "Invalid descriptor %" PRIu16" (req_idx = %"PRIu16").\n",
 				      req_idx, cnt);
 			return -1;
 		}
 
-		len += iovs[cnt].iov_len;
-		cnt++;
+		len += desc->len;
 
 		out_cnt += spdk_vhost_vring_desc_is_wr(desc);
 
-		if (spdk_vhost_vring_desc_has_next(desc)) {
-			desc = spdk_vhost_vring_desc_get_next(vq->desc, desc);
-		} else {
+		rc = spdk_vhost_vring_desc_get_next(&desc, desc_table, desc_table_size);
+		if (rc != 0) {
+			SPDK_ERRLOG("%s: Descriptor chain at index %"PRIu16" terminated unexpectedly.\n",
+				    vdev->name, req_idx);
+			return -1;
+		} else if (desc == NULL) {
 			break;
 		}
 	}
@@ -175,11 +166,11 @@ static void
 blk_request_finish(bool success, struct spdk_vhost_blk_task *task)
 {
 	*task->status = success ? VIRTIO_BLK_S_OK : VIRTIO_BLK_S_IOERR;
-	spdk_vhost_vq_used_ring_enqueue(&task->bvdev->vdev, &task->bvdev->vdev.virtqueue[0], task->req_idx,
-					task->length);
-	SPDK_TRACELOG(SPDK_TRACE_VHOST_BLK, "Finished task (%p) req_idx=%d\n status: %s\n", task,
+	spdk_vhost_vq_used_ring_enqueue(&task->bvdev->vdev, task->vq, task->req_idx,
+					task->used_len);
+	SPDK_DEBUGLOG(SPDK_LOG_VHOST_BLK, "Finished task (%p) req_idx=%d\n status: %s\n", task,
 		      task->req_idx, success ? "OK" : "FAIL");
-	spdk_vhost_blk_put_tasks(task->bvdev, &task, 1);
+	blk_task_finish(task);
 }
 
 static void
@@ -191,50 +182,45 @@ blk_request_complete_cb(struct spdk_bdev_io *bdev_io, bool success, void *cb_arg
 	blk_request_finish(success, task);
 }
 
-static void
+static int
 process_blk_request(struct spdk_vhost_blk_task *task, struct spdk_vhost_blk_dev *bvdev,
-		    uint16_t req_idx)
+		    struct spdk_vhost_virtqueue *vq)
 {
-	struct rte_vhost_vring *vq = &bvdev->vdev.virtqueue[0];
 	const struct virtio_blk_outhdr *req;
 	struct iovec *iov;
-	uint64_t offset;
 	uint32_t type;
+	uint32_t payload_len;
 	int rc;
 
-	SPDK_TRACELOG(SPDK_TRACE_VHOST_BLK, "====== Starting processing request idx %"PRIu16"======\n",
-		      req_idx);
-
-	assert(task->bvdev == bvdev);
-	task->req_idx = req_idx;
-	task->iovcnt = SPDK_COUNTOF(task->iovs);
-
-	if (blk_iovs_setup(&bvdev->vdev, vq, req_idx, task->iovs, &task->iovcnt, &task->length)) {
-		SPDK_TRACELOG(SPDK_TRACE_VHOST_BLK, "Invalid request (req_idx = %"PRIu16").\n", req_idx);
+	if (blk_iovs_setup(&bvdev->vdev, vq, task->req_idx, task->iovs, &task->iovcnt, &payload_len)) {
+		SPDK_DEBUGLOG(SPDK_LOG_VHOST_BLK, "Invalid request (req_idx = %"PRIu16").\n", task->req_idx);
 		/* Only READ and WRITE are supported for now. */
-		goto err;
+		invalid_blk_request(task, VIRTIO_BLK_S_UNSUPP);
+		return -1;
 	}
 
 	iov = &task->iovs[0];
 	if (spdk_unlikely(iov->iov_len != sizeof(*req))) {
-		SPDK_TRACELOG(SPDK_TRACE_VHOST_BLK,
+		SPDK_DEBUGLOG(SPDK_LOG_VHOST_BLK,
 			      "First descriptor size is %zu but expected %zu (req_idx = %"PRIu16").\n",
-			      iov->iov_len, sizeof(*req), req_idx);
-		goto err;
+			      iov->iov_len, sizeof(*req), task->req_idx);
+		invalid_blk_request(task, VIRTIO_BLK_S_UNSUPP);
+		return -1;
 	}
 
 	req = iov->iov_base;
 
 	iov = &task->iovs[task->iovcnt - 1];
 	if (spdk_unlikely(iov->iov_len != 1)) {
-		SPDK_TRACELOG(SPDK_TRACE_VHOST_BLK,
+		SPDK_DEBUGLOG(SPDK_LOG_VHOST_BLK,
 			      "Last descriptor size is %zu but expected %d (req_idx = %"PRIu16").\n",
-			      iov->iov_len, 1, req_idx);
-		goto err;
+			      iov->iov_len, 1, task->req_idx);
+		invalid_blk_request(task, VIRTIO_BLK_S_UNSUPP);
+		return -1;
 	}
 
 	task->status = iov->iov_base;
-	task->length -= sizeof(*req) + 1;
+	payload_len -= sizeof(*req) + sizeof(*task->status);
 	task->iovcnt -= 2;
 
 	type = req->type;
@@ -246,58 +232,57 @@ process_blk_request(struct spdk_vhost_blk_task *task, struct spdk_vhost_blk_dev 
 	switch (type) {
 	case VIRTIO_BLK_T_IN:
 	case VIRTIO_BLK_T_OUT:
-		offset = req->sector * 512;
-		if (spdk_unlikely((task->length & (512 - 1)) != 0)) {
+		if (spdk_unlikely((payload_len & (512 - 1)) != 0)) {
 			SPDK_ERRLOG("%s - passed IO buffer is not multiple of 512b (req_idx = %"PRIu16").\n",
-				    type ? "WRITE" : "READ", req_idx);
-			goto err;
+				    type ? "WRITE" : "READ", task->req_idx);
+			invalid_blk_request(task, VIRTIO_BLK_S_UNSUPP);
+			return -1;
 		}
 
 		if (type == VIRTIO_BLK_T_IN) {
-			rc = spdk_bdev_readv(bvdev->bdev, bvdev->bdev_io_channel,
-					     &task->iovs[1], task->iovcnt, offset,
-					     task->length, blk_request_complete_cb, task);
+			task->used_len = payload_len + sizeof(*task->status);
+			rc = spdk_bdev_readv(bvdev->bdev_desc, bvdev->bdev_io_channel,
+					     &task->iovs[1], task->iovcnt, req->sector * 512,
+					     payload_len, blk_request_complete_cb, task);
 		} else if (!bvdev->readonly) {
-			rc = spdk_bdev_writev(bvdev->bdev, bvdev->bdev_io_channel,
-					      &task->iovs[1], task->iovcnt, offset,
-					      task->length, blk_request_complete_cb, task);
+			task->used_len = sizeof(*task->status);
+			rc = spdk_bdev_writev(bvdev->bdev_desc, bvdev->bdev_io_channel,
+					      &task->iovs[1], task->iovcnt, req->sector * 512,
+					      payload_len, blk_request_complete_cb, task);
 		} else {
-			SPDK_TRACELOG(SPDK_TRACE_VHOST_BLK, "Device is in read-only mode!\n");
+			SPDK_DEBUGLOG(SPDK_LOG_VHOST_BLK, "Device is in read-only mode!\n");
 			rc = -1;
 		}
 
 		if (rc) {
-			goto err;
+			invalid_blk_request(task, VIRTIO_BLK_S_IOERR);
+			return -1;
 		}
 		break;
 	case VIRTIO_BLK_T_GET_ID:
-		if (!task->iovcnt || !task->length) {
-			goto err;
+		if (!task->iovcnt || !payload_len) {
+			invalid_blk_request(task, VIRTIO_BLK_S_UNSUPP);
+			return -1;
 		}
-		task->length = spdk_min((size_t)VIRTIO_BLK_ID_BYTES, task->iovs[1].iov_len);
-		spdk_strcpy_pad(task->iovs[1].iov_base, spdk_bdev_get_product_name(bvdev->bdev), task->length, ' ');
+		task->used_len = spdk_min((size_t)VIRTIO_BLK_ID_BYTES, task->iovs[1].iov_len);
+		spdk_strcpy_pad(task->iovs[1].iov_base, spdk_bdev_get_product_name(bvdev->bdev),
+				task->used_len, ' ');
 		blk_request_finish(true, task);
 		break;
 	default:
-		SPDK_TRACELOG(SPDK_TRACE_VHOST_BLK, "Not supported request type '%"PRIu32"'.\n", type);
-		goto err;
+		SPDK_DEBUGLOG(SPDK_LOG_VHOST_BLK, "Not supported request type '%"PRIu32"'.\n", type);
+		invalid_blk_request(task, VIRTIO_BLK_S_UNSUPP);
+		return -1;
 	}
 
-	SPDK_TRACELOG(SPDK_TRACE_VHOST_BLK, "====== Task %p req_idx %d submitted ======\n", task,
-		      req_idx);
-	return;
-
-err:
-	invalid_blk_request(task, VIRTIO_BLK_S_UNSUPP);
-	SPDK_TRACELOG(SPDK_TRACE_VHOST_BLK, "====== Task %p req_idx %d failed ======\n", task, req_idx);
+	return 0;
 }
 
 static void
-vdev_worker(void *arg)
+process_vq(struct spdk_vhost_blk_dev *bvdev, struct spdk_vhost_virtqueue *vq)
 {
-	struct spdk_vhost_blk_dev *bvdev = arg;
-	struct rte_vhost_vring *vq = &bvdev->vdev.virtqueue[0];
-	struct spdk_vhost_blk_task *tasks[32] = {0};
+	struct spdk_vhost_blk_task *task;
+	int rc;
 	uint16_t reqs[32];
 	uint16_t reqs_cnt, i;
 
@@ -306,18 +291,61 @@ vdev_worker(void *arg)
 		return;
 	}
 
-	spdk_vhost_blk_get_tasks(bvdev, tasks, reqs_cnt);
 	for (i = 0; i < reqs_cnt; i++) {
-		process_blk_request(tasks[i], bvdev, reqs[i]);
+		SPDK_DEBUGLOG(SPDK_LOG_VHOST_BLK, "====== Starting processing request idx %"PRIu16"======\n",
+			      reqs[i]);
+
+		if (spdk_unlikely(reqs[i] >= vq->vring.size)) {
+			SPDK_ERRLOG("%s: request idx '%"PRIu16"' exceeds virtqueue size (%"PRIu16").\n",
+				    bvdev->vdev.name, reqs[i], vq->vring.size);
+			spdk_vhost_vq_used_ring_enqueue(&bvdev->vdev, vq, reqs[i], 0);
+			continue;
+		}
+
+		task = &((struct spdk_vhost_blk_task *)vq->tasks)[reqs[i]];
+		if (spdk_unlikely(task->used)) {
+			SPDK_ERRLOG("%s: request with idx '%"PRIu16"' is already pending.\n",
+				    bvdev->vdev.name, reqs[i]);
+			spdk_vhost_vq_used_ring_enqueue(&bvdev->vdev, vq, reqs[i], 0);
+			continue;
+		}
+
+		bvdev->vdev.task_cnt++;
+
+		task->used = true;
+		task->iovcnt = SPDK_COUNTOF(task->iovs);
+		task->status = NULL;
+		task->used_len = 0;
+
+		rc = process_blk_request(task, bvdev, vq);
+		if (rc == 0) {
+			SPDK_DEBUGLOG(SPDK_LOG_VHOST_BLK, "====== Task %p req_idx %d submitted ======\n", task,
+				      reqs[i]);
+		} else {
+			SPDK_DEBUGLOG(SPDK_LOG_VHOST_BLK, "====== Task %p req_idx %d failed ======\n", task, reqs[i]);
+		}
 	}
 }
 
-static void
-no_bdev_vdev_worker(void *arg)
+static int
+vdev_worker(void *arg)
 {
 	struct spdk_vhost_blk_dev *bvdev = arg;
-	struct rte_vhost_vring *vq = &bvdev->vdev.virtqueue[0];
-	struct iovec iovs[VHOST_BLK_IOVS_MAX];
+	uint16_t q_idx;
+
+	for (q_idx = 0; q_idx < bvdev->vdev.max_queues; q_idx++) {
+		process_vq(bvdev, &bvdev->vdev.virtqueue[q_idx]);
+	}
+
+	spdk_vhost_dev_used_signal(&bvdev->vdev);
+
+	return -1;
+}
+
+static void
+no_bdev_process_vq(struct spdk_vhost_blk_dev *bvdev, struct spdk_vhost_virtqueue *vq)
+{
+	struct iovec iovs[SPDK_VHOST_IOVS_MAX];
 	uint32_t length;
 	uint16_t iovcnt, req_idx;
 
@@ -326,79 +354,27 @@ no_bdev_vdev_worker(void *arg)
 	}
 
 	iovcnt = SPDK_COUNTOF(iovs);
-	if (blk_iovs_setup(&bvdev->vdev, vq, req_idx, iovs, &iovcnt, &length) && iovcnt >= 2) {
+	if (blk_iovs_setup(&bvdev->vdev, vq, req_idx, iovs, &iovcnt, &length) == 0) {
 		*(volatile uint8_t *)iovs[iovcnt - 1].iov_base = VIRTIO_BLK_S_IOERR;
-		SPDK_TRACELOG(SPDK_TRACE_VHOST_BLK_DATA, "Aborting request %" PRIu16"\n", req_idx);
+		SPDK_DEBUGLOG(SPDK_LOG_VHOST_BLK_DATA, "Aborting request %" PRIu16"\n", req_idx);
 	}
 
 	spdk_vhost_vq_used_ring_enqueue(&bvdev->vdev, vq, req_idx, 0);
 }
 
-static void
-add_vdev_cb(void *arg)
+static int
+no_bdev_vdev_worker(void *arg)
 {
 	struct spdk_vhost_blk_dev *bvdev = arg;
-	struct spdk_vhost_dev *vdev = &bvdev->vdev;
-	struct spdk_vhost_blk_task *task;
-	size_t rc;
-	uint32_t i;
+	uint16_t q_idx;
 
-	spdk_vhost_dev_mem_register(&bvdev->vdev);
-
-	if (bvdev->bdev) {
-		bvdev->bdev_io_channel = spdk_bdev_get_io_channel(bvdev->bdev_desc);
-		if (!bvdev->bdev_io_channel) {
-			SPDK_ERRLOG("Controller %s: IO channel allocation failed\n", vdev->name);
-			abort();
-		}
+	for (q_idx = 0; q_idx < bvdev->vdev.max_queues; q_idx++) {
+		no_bdev_process_vq(bvdev, &bvdev->vdev.virtqueue[q_idx]);
 	}
 
-	bvdev->tasks_pool = spdk_ring_create(SPDK_RING_TYPE_SP_SC, vdev->virtqueue[0].size * 2,
-					     spdk_env_get_socket_id(vdev->lcore));
+	spdk_vhost_dev_used_signal(&bvdev->vdev);
 
-	for (i = 0; i < vdev->virtqueue[0].size; i++) {
-		task = spdk_dma_zmalloc(sizeof(*task), SPDK_CACHE_LINE_SIZE, NULL);
-		if (task == NULL) {
-			// TODO: add a mechanism to report failure so we can handle this properly
-			SPDK_ERRLOG("task allocation failed\n");
-			abort();
-		}
-		task->bvdev = bvdev;
-
-		rc = spdk_ring_enqueue(bvdev->tasks_pool, (void **)&task, 1);
-		if (rc != 1) {
-			assert(false);
-		}
-	}
-
-	spdk_poller_register(&bvdev->requestq_poller, bvdev->bdev ? vdev_worker : no_bdev_vdev_worker,
-			     bvdev, vdev->lcore, 0);
-	SPDK_NOTICELOG("Started poller for vhost controller %s on lcore %d\n", vdev->name, vdev->lcore);
-}
-
-static void
-remove_vdev_cb(void *arg)
-{
-	struct spdk_vhost_blk_dev *bvdev = arg;
-	struct spdk_vhost_blk_task *task;
-
-	SPDK_NOTICELOG("Stopping poller for vhost controller %s\n", bvdev->vdev.name);
-
-	assert(rte_ring_count((struct rte_ring *)bvdev->tasks_pool) == bvdev->vdev.virtqueue[0].size);
-
-	if (bvdev->bdev_io_channel) {
-		spdk_put_io_channel(bvdev->bdev_io_channel);
-		bvdev->bdev_io_channel = NULL;
-	}
-
-	while (spdk_ring_dequeue(bvdev->tasks_pool, (void **)&task, 1) == 1) {
-		spdk_dma_free(task);
-	}
-
-	spdk_ring_free(bvdev->tasks_pool);
-	bvdev->tasks_pool = NULL;
-
-	spdk_vhost_dev_mem_unregister(&bvdev->vdev);
+	return -1;
 }
 
 static struct spdk_vhost_blk_dev *
@@ -408,9 +384,8 @@ to_blk_dev(struct spdk_vhost_dev *vdev)
 		return NULL;
 	}
 
-	if (vdev->type != SPDK_VHOST_DEV_T_BLK) {
-		SPDK_ERRLOG("Controller %s: expected block controller (%d) but got %d\n",
-			    vdev->name, SPDK_VHOST_DEV_T_BLK, vdev->type);
+	if (vdev->backend != &vhost_blk_device_backend) {
+		SPDK_ERRLOG("%s: not a vhost-blk device\n", vdev->name);
 		return NULL;
 	}
 
@@ -426,20 +401,90 @@ spdk_vhost_blk_get_dev(struct spdk_vhost_dev *vdev)
 	return bvdev->bdev;
 }
 
-bool
-spdk_vhost_blk_get_readonly(struct spdk_vhost_dev *vdev)
+static int
+_bdev_remove_cb(struct spdk_vhost_dev *vdev, void *arg)
 {
-	struct spdk_vhost_blk_dev *bvdev = to_blk_dev(vdev);
+	struct spdk_vhost_blk_dev *bvdev = arg;
 
-	assert(bvdev != NULL);
-	return bvdev->readonly;
+	SPDK_WARNLOG("Controller %s: Hot-removing bdev - all further requests will fail.\n",
+		     bvdev->vdev.name);
+	if (bvdev->requestq_poller) {
+		spdk_poller_unregister(&bvdev->requestq_poller);
+		bvdev->requestq_poller = spdk_poller_register(no_bdev_vdev_worker, bvdev, 0);
+	}
+
+	spdk_bdev_close(bvdev->bdev_desc);
+	bvdev->bdev_desc = NULL;
+	bvdev->bdev = NULL;
+	return 0;
 }
 
 static void
 bdev_remove_cb(void *remove_ctx)
 {
-	SPDK_ERRLOG("Hot-removing bdev's not supported yet.\n");
-	abort();
+	struct spdk_vhost_blk_dev *bvdev = remove_ctx;
+
+	spdk_vhost_call_external_event(bvdev->vdev.name, _bdev_remove_cb, bvdev);
+}
+
+static void
+free_task_pool(struct spdk_vhost_blk_dev *bvdev)
+{
+	struct spdk_vhost_virtqueue *vq;
+	uint16_t i;
+
+	for (i = 0; i < bvdev->vdev.max_queues; i++) {
+		vq = &bvdev->vdev.virtqueue[i];
+		if (vq->tasks == NULL) {
+			continue;
+		}
+
+		spdk_dma_free(vq->tasks);
+		vq->tasks = NULL;
+	}
+}
+
+static int
+alloc_task_pool(struct spdk_vhost_blk_dev *bvdev)
+{
+	struct spdk_vhost_virtqueue *vq;
+	struct spdk_vhost_blk_task *task;
+	uint32_t task_cnt;
+	uint16_t i;
+	uint32_t j;
+
+	for (i = 0; i < bvdev->vdev.max_queues; i++) {
+		vq = &bvdev->vdev.virtqueue[i];
+		if (vq->vring.desc == NULL) {
+			continue;
+		}
+
+		task_cnt = vq->vring.size;
+		if (task_cnt > SPDK_VHOST_MAX_VQ_SIZE) {
+			/* sanity check */
+			SPDK_ERRLOG("Controller %s: virtuque %"PRIu16" is too big. (size = %"PRIu32", max = %"PRIu32")\n",
+				    bvdev->vdev.name, i, task_cnt, SPDK_VHOST_MAX_VQ_SIZE);
+			free_task_pool(bvdev);
+			return -1;
+		}
+		vq->tasks = spdk_dma_zmalloc(sizeof(struct spdk_vhost_blk_task) * task_cnt,
+					     SPDK_CACHE_LINE_SIZE, NULL);
+		if (vq->tasks == NULL) {
+			SPDK_ERRLOG("Controller %s: failed to allocate %"PRIu32" tasks for virtqueue %"PRIu16"\n",
+				    bvdev->vdev.name, task_cnt, i);
+			free_task_pool(bvdev);
+			return -1;
+		}
+
+		for (j = 0; j < task_cnt; j++) {
+			task = &((struct spdk_vhost_blk_task *)vq->tasks)[j];
+			task->bvdev = bvdev;
+			task->req_idx = j;
+			task->vq = vq;
+		}
+	}
+
+	return 0;
 }
 
 /*
@@ -448,74 +493,233 @@ bdev_remove_cb(void *remove_ctx)
  *
  */
 static int
-new_device(int vid)
+spdk_vhost_blk_start(struct spdk_vhost_dev *vdev, void *event_ctx)
 {
-	struct spdk_vhost_dev *vdev;
+	struct spdk_vhost_blk_dev *bvdev;
+	int i, rc = 0;
 
-	vdev = spdk_vhost_dev_load(vid);
-	if (vdev == NULL) {
+	bvdev = to_blk_dev(vdev);
+	if (bvdev == NULL) {
+		SPDK_ERRLOG("Trying to start non-blk controller as a blk one.\n");
+		rc = -1;
+		goto out;
+	}
+
+	/* validate all I/O queues are in a contiguous index range */
+	for (i = 0; i < vdev->max_queues; i++) {
+		if (vdev->virtqueue[i].vring.desc == NULL) {
+			SPDK_ERRLOG("%s: queue %"PRIu32" is empty\n", vdev->name, i);
+			rc = -1;
+			goto out;
+		}
+	}
+
+	rc = alloc_task_pool(bvdev);
+	if (rc != 0) {
+		SPDK_ERRLOG("%s: failed to alloc task pool.\n", bvdev->vdev.name);
+		goto out;
+	}
+
+	if (bvdev->bdev) {
+		bvdev->bdev_io_channel = spdk_bdev_get_io_channel(bvdev->bdev_desc);
+		if (!bvdev->bdev_io_channel) {
+			SPDK_ERRLOG("Controller %s: IO channel allocation failed\n", vdev->name);
+			rc = -1;
+			goto out;
+		}
+	}
+
+	bvdev->requestq_poller = spdk_poller_register(bvdev->bdev ? vdev_worker : no_bdev_vdev_worker,
+				 bvdev, 0);
+	SPDK_INFOLOG(SPDK_LOG_VHOST, "Started poller for vhost controller %s on lcore %d\n",
+		     vdev->name, vdev->lcore);
+out:
+	spdk_vhost_dev_backend_event_done(event_ctx, rc);
+	return rc;
+}
+
+struct spdk_vhost_dev_destroy_ctx {
+	struct spdk_vhost_blk_dev *bvdev;
+	struct spdk_poller *poller;
+	void *event_ctx;
+};
+
+static int
+destroy_device_poller_cb(void *arg)
+{
+	struct spdk_vhost_dev_destroy_ctx *ctx = arg;
+	struct spdk_vhost_blk_dev *bvdev = ctx->bvdev;
+	int i;
+
+	if (bvdev->vdev.task_cnt > 0) {
 		return -1;
 	}
 
-	if (vdev->num_queues != 1) {
-		SPDK_ERRLOG("Controller %s virtio-block device must have exactly one queue but got %d.\n",
-			    vdev->name, vdev->num_queues);
-		vdev->vid = -1;
-		return -1;
+	for (i = 0; i < bvdev->vdev.max_queues; i++) {
+		bvdev->vdev.virtqueue[i].next_event_time = 0;
+		spdk_vhost_vq_used_signal(&bvdev->vdev, &bvdev->vdev.virtqueue[i]);
 	}
 
-	spdk_vhost_timed_event_send(vdev->lcore, add_vdev_cb, vdev, 1, "add blk vdev");
+	SPDK_INFOLOG(SPDK_LOG_VHOST, "Stopping poller for vhost controller %s\n", bvdev->vdev.name);
+
+	if (bvdev->bdev_io_channel) {
+		spdk_put_io_channel(bvdev->bdev_io_channel);
+		bvdev->bdev_io_channel = NULL;
+	}
+
+	free_task_pool(bvdev);
+
+	spdk_poller_unregister(&ctx->poller);
+	spdk_vhost_dev_backend_event_done(ctx->event_ctx, 0);
+	spdk_dma_free(ctx);
+
+	return -1;
+}
+
+static int
+spdk_vhost_blk_stop(struct spdk_vhost_dev *vdev, void *event_ctx)
+{
+	struct spdk_vhost_blk_dev *bvdev;
+	struct spdk_vhost_dev_destroy_ctx *destroy_ctx;
+
+	bvdev = to_blk_dev(vdev);
+	if (bvdev == NULL) {
+		SPDK_ERRLOG("Trying to stop non-blk controller as a blk one.\n");
+		goto err;
+	}
+
+	destroy_ctx = spdk_dma_zmalloc(sizeof(*destroy_ctx), SPDK_CACHE_LINE_SIZE, NULL);
+	if (destroy_ctx == NULL) {
+		SPDK_ERRLOG("Failed to alloc memory for destroying device.\n");
+		goto err;
+	}
+
+	destroy_ctx->bvdev = bvdev;
+	destroy_ctx->event_ctx = event_ctx;
+
+	spdk_poller_unregister(&bvdev->requestq_poller);
+	destroy_ctx->poller = spdk_poller_register(destroy_device_poller_cb,
+			      destroy_ctx, 1000);
 	return 0;
+
+err:
+	spdk_vhost_dev_backend_event_done(event_ctx, -1);
+	return -1;
 }
 
 static void
-destroy_device(int vid)
+spdk_vhost_blk_dump_info_json(struct spdk_vhost_dev *vdev, struct spdk_json_write_ctx *w)
 {
+	struct spdk_bdev *bdev = spdk_vhost_blk_get_dev(vdev);
 	struct spdk_vhost_blk_dev *bvdev;
-	struct spdk_vhost_dev *vdev;
-	struct spdk_vhost_timed_event event = {0};
-	uint32_t i;
 
-	vdev = spdk_vhost_dev_find_by_vid(vid);
 	bvdev = to_blk_dev(vdev);
 	if (bvdev == NULL) {
-		SPDK_ERRLOG("Couldn't find device with vid %d to stop.\n", vid);
-		abort();
+		return;
 	}
 
-	spdk_vhost_timed_event_init(&event, vdev->lcore, NULL, NULL, 1);
-	spdk_poller_unregister(&bvdev->requestq_poller, event.spdk_event);
-	spdk_vhost_timed_event_wait(&event, "unregister poller");
+	assert(bvdev != NULL);
+	spdk_json_write_name(w, "block");
+	spdk_json_write_object_begin(w);
 
-	/* Wait for all tasks to finish */
-	for (i = 1000; i && vdev->task_cnt > 0; i--) {
-		usleep(1000);
+	spdk_json_write_name(w, "readonly");
+	spdk_json_write_bool(w, bvdev->readonly);
+
+	spdk_json_write_name(w, "bdev");
+	if (bdev) {
+		spdk_json_write_string(w, spdk_bdev_get_name(bdev));
+	} else {
+		spdk_json_write_null(w);
 	}
 
-	if (vdev->task_cnt > 0) {
-		SPDK_ERRLOG("%s: pending tasks did not finish in 1s.\n", vdev->name);
-		abort();
+	spdk_json_write_object_end(w);
+}
+
+static void
+spdk_vhost_blk_write_config_json(struct spdk_vhost_dev *vdev, struct spdk_json_write_ctx *w)
+{
+	struct spdk_vhost_blk_dev *bvdev;
+
+	bvdev = to_blk_dev(vdev);
+	if (bvdev == NULL) {
+		return;
 	}
 
-	spdk_vhost_timed_event_send(vdev->lcore, remove_vdev_cb, bvdev, 1, "remove vdev");
-	spdk_vhost_dev_unload(vdev);
+	if (!bvdev->bdev) {
+		return;
+	}
+
+	spdk_json_write_object_begin(w);
+	spdk_json_write_named_string(w, "method", "construct_vhost_blk_controller");
+
+	spdk_json_write_named_object_begin(w, "params");
+	spdk_json_write_named_string(w, "ctrlr", vdev->name);
+	spdk_json_write_named_string(w, "dev_name", spdk_bdev_get_name(bvdev->bdev));
+	spdk_json_write_named_string(w, "cpumask", spdk_cpuset_fmt(vdev->cpumask));
+	spdk_json_write_named_bool(w, "readonly", bvdev->readonly);
+	spdk_json_write_object_end(w);
+
+	spdk_json_write_object_end(w);
+}
+
+static int spdk_vhost_blk_destroy(struct spdk_vhost_dev *dev);
+
+static int
+spdk_vhost_blk_get_config(struct spdk_vhost_dev *vdev, uint8_t *config,
+			  uint32_t len)
+{
+	struct virtio_blk_config *blkcfg = (struct virtio_blk_config *)config;
+	struct spdk_vhost_blk_dev *bvdev;
+	struct spdk_bdev *bdev;
+	uint32_t blk_size;
+	uint64_t blkcnt;
+
+	bvdev = to_blk_dev(vdev);
+	if (bvdev == NULL) {
+		SPDK_ERRLOG("Trying to get virito_blk configuration failed\n");
+		return -1;
+	}
+
+	if (len < sizeof(*blkcfg)) {
+		return -1;
+	}
+
+	bdev = bvdev->bdev;
+	blk_size = spdk_bdev_get_block_size(bdev);
+	blkcnt = spdk_bdev_get_num_blocks(bdev);
+
+	memset(blkcfg, 0, sizeof(*blkcfg));
+	blkcfg->blk_size = blk_size;
+	/* minimum I/O size in blocks */
+	blkcfg->min_io_size = 1;
+	/* expressed in 512 Bytes sectors */
+	blkcfg->capacity = (blkcnt * blk_size) / 512;
+	blkcfg->size_max = 131072;
+	/*  -2 for REQ and RESP and -1 for region boundary splitting */
+	blkcfg->seg_max = SPDK_VHOST_IOVS_MAX - 2 - 1;
+	/* QEMU can overwrite this value when started */
+	blkcfg->num_queues = SPDK_VHOST_MAX_VQUEUES;
+
+	return 0;
 }
 
 static const struct spdk_vhost_dev_backend vhost_blk_device_backend = {
-	.virtio_features = (1ULL << VHOST_F_LOG_ALL) | (1ULL << VHOST_USER_F_PROTOCOL_FEATURES) |
-	(1ULL << VIRTIO_F_VERSION_1) | (1ULL << VIRTIO_F_NOTIFY_ON_EMPTY) |
+	.virtio_features = SPDK_VHOST_FEATURES |
 	(1ULL << VIRTIO_BLK_F_SIZE_MAX) | (1ULL << VIRTIO_BLK_F_SEG_MAX) |
 	(1ULL << VIRTIO_BLK_F_GEOMETRY) | (1ULL << VIRTIO_BLK_F_RO) |
 	(1ULL << VIRTIO_BLK_F_BLK_SIZE) | (1ULL << VIRTIO_BLK_F_TOPOLOGY) |
 	(1ULL << VIRTIO_BLK_F_BARRIER)  | (1ULL << VIRTIO_BLK_F_SCSI) |
-	(1ULL << VIRTIO_BLK_F_FLUSH)    | (1ULL << VIRTIO_BLK_F_CONFIG_WCE),
-	.disabled_features = (1ULL << VHOST_F_LOG_ALL) | (1ULL << VIRTIO_BLK_F_GEOMETRY) |
+	(1ULL << VIRTIO_BLK_F_FLUSH)    | (1ULL << VIRTIO_BLK_F_CONFIG_WCE) |
+	(1ULL << VIRTIO_BLK_F_MQ),
+	.disabled_features = SPDK_VHOST_DISABLED_FEATURES | (1ULL << VIRTIO_BLK_F_GEOMETRY) |
 	(1ULL << VIRTIO_BLK_F_RO) | (1ULL << VIRTIO_BLK_F_FLUSH) | (1ULL << VIRTIO_BLK_F_CONFIG_WCE) |
 	(1ULL << VIRTIO_BLK_F_BARRIER) | (1ULL << VIRTIO_BLK_F_SCSI),
-	.ops = {
-		.new_device =  new_device,
-		.destroy_device = destroy_device,
-	}
+	.start_device =  spdk_vhost_blk_start,
+	.stop_device = spdk_vhost_blk_stop,
+	.vhost_get_config = spdk_vhost_blk_get_config,
+	.dump_info_json = spdk_vhost_blk_dump_info_json,
+	.write_config_json = spdk_vhost_blk_write_config_json,
+	.remove_device = spdk_vhost_blk_destroy,
 };
 
 int
@@ -524,9 +728,8 @@ spdk_vhost_blk_controller_construct(void)
 	struct spdk_conf_section *sp;
 	unsigned ctrlr_num;
 	char *bdev_name;
-	char *cpumask_str;
+	char *cpumask;
 	char *name;
-	uint64_t cpumask;
 	bool readonly;
 
 	for (sp = spdk_conf_first_section(NULL); sp != NULL; sp = spdk_conf_next_section(sp)) {
@@ -546,14 +749,8 @@ spdk_vhost_blk_controller_construct(void)
 			return -1;
 		}
 
-		cpumask_str = spdk_conf_section_get_val(sp, "Cpumask");
+		cpumask = spdk_conf_section_get_val(sp, "Cpumask");
 		readonly = spdk_conf_section_get_boolval(sp, "ReadOnly", false);
-		if (cpumask_str == NULL) {
-			cpumask = spdk_app_get_core_mask();
-		} else if (spdk_vhost_parse_core_mask(cpumask_str, &cpumask)) {
-			SPDK_ERRLOG("%s: Error parsing cpumask '%s' while creating controller\n", name, cpumask_str);
-			return -1;
-		}
 
 		bdev_name = spdk_conf_section_get_val(sp, "Dev");
 		if (bdev_name == NULL) {
@@ -569,83 +766,89 @@ spdk_vhost_blk_controller_construct(void)
 }
 
 int
-spdk_vhost_blk_construct(const char *name, uint64_t cpumask, const char *dev_name, bool readonly)
+spdk_vhost_blk_construct(const char *name, const char *cpumask, const char *dev_name, bool readonly)
 {
-	struct spdk_vhost_blk_dev *bvdev;
+	struct spdk_vhost_blk_dev *bvdev = NULL;
 	struct spdk_bdev *bdev;
-	int ret;
+	int ret = 0;
 
+	spdk_vhost_lock();
 	bdev = spdk_bdev_get_by_name(dev_name);
 	if (bdev == NULL) {
 		SPDK_ERRLOG("Controller %s: bdev '%s' not found\n",
 			    name, dev_name);
-		return -1;
+		ret = -1;
+		goto out;
 	}
 
 	bvdev = spdk_dma_zmalloc(sizeof(*bvdev), SPDK_CACHE_LINE_SIZE, NULL);
 	if (bvdev == NULL) {
-		return -1;
+		ret = -1;
+		goto out;
 	}
 
 	ret = spdk_bdev_open(bdev, true, bdev_remove_cb, bvdev, &bvdev->bdev_desc);
 	if (ret != 0) {
 		SPDK_ERRLOG("Controller %s: could not open bdev '%s', error=%d\n",
 			    name, dev_name, ret);
-		goto err;
+		ret = -1;
+		goto out;
 	}
 
 	bvdev->bdev = bdev;
 	bvdev->readonly = readonly;
-	ret = spdk_vhost_dev_construct(&bvdev->vdev, name, cpumask, SPDK_VHOST_DEV_T_BLK,
-				       &vhost_blk_device_backend);
+	ret = spdk_vhost_dev_register(&bvdev->vdev, name, cpumask, &vhost_blk_device_backend);
 	if (ret != 0) {
 		spdk_bdev_close(bvdev->bdev_desc);
-		goto err;
+		ret = -1;
+		goto out;
 	}
 
 	if (readonly && rte_vhost_driver_enable_features(bvdev->vdev.path, (1ULL << VIRTIO_BLK_F_RO))) {
 		SPDK_ERRLOG("Controller %s: failed to set as a readonly\n", name);
 		spdk_bdev_close(bvdev->bdev_desc);
 
-		if (spdk_vhost_dev_remove(&bvdev->vdev) != 0) {
+		if (spdk_vhost_dev_unregister(&bvdev->vdev) != 0) {
 			SPDK_ERRLOG("Controller %s: failed to remove controller\n", name);
 		}
 
-		goto err;
+		ret = -1;
+		goto out;
 	}
 
-	SPDK_NOTICELOG("Controller %s: using bdev '%s'\n",
-		       name, dev_name);
-
-	return 0;
-
-err:
-	spdk_dma_free(bvdev);
-	return -1;
+	SPDK_INFOLOG(SPDK_LOG_VHOST, "Controller %s: using bdev '%s'\n", name, dev_name);
+out:
+	if (ret != 0 && bvdev) {
+		spdk_dma_free(bvdev);
+	}
+	spdk_vhost_unlock();
+	return ret;
 }
 
-int
+static int
 spdk_vhost_blk_destroy(struct spdk_vhost_dev *vdev)
 {
 	struct spdk_vhost_blk_dev *bvdev = to_blk_dev(vdev);
+	int rc;
 
 	if (!bvdev) {
 		return -EINVAL;
 	}
 
-	spdk_bdev_close(bvdev->bdev_desc);
-	bvdev->bdev = NULL;
-
-	SPDK_NOTICELOG("Controller %s: removed device\n", vdev->name);
-
-	if (spdk_vhost_dev_remove(&bvdev->vdev)) {
-		return -EIO;
+	rc = spdk_vhost_dev_unregister(&bvdev->vdev);
+	if (rc != 0) {
+		return rc;
 	}
+
+	if (bvdev->bdev_desc) {
+		spdk_bdev_close(bvdev->bdev_desc);
+		bvdev->bdev_desc = NULL;
+	}
+	bvdev->bdev = NULL;
 
 	spdk_dma_free(bvdev);
 	return 0;
 }
 
-SPDK_LOG_REGISTER_TRACE_FLAG("vhost_blk", SPDK_TRACE_VHOST_BLK)
-SPDK_LOG_REGISTER_TRACE_FLAG("vhost_blk_task", SPDK_TRACE_VHOST_BLK_TASK)
-SPDK_LOG_REGISTER_TRACE_FLAG("vhost_blk_data", SPDK_TRACE_VHOST_BLK_DATA)
+SPDK_LOG_REGISTER_COMPONENT("vhost_blk", SPDK_LOG_VHOST_BLK)
+SPDK_LOG_REGISTER_COMPONENT("vhost_blk_data", SPDK_LOG_VHOST_BLK_DATA)

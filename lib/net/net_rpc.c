@@ -31,6 +31,8 @@
  *   OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 
+#include "net_internal.h"
+
 #include "spdk/stdinc.h"
 
 #include "spdk/rpc.h"
@@ -65,7 +67,7 @@ spdk_rpc_add_ip_address(struct spdk_jsonrpc_request *request,
 	if (spdk_json_decode_object(params, rpc_ip_address_decoders,
 				    SPDK_COUNTOF(rpc_ip_address_decoders),
 				    &req)) {
-		SPDK_TRACELOG(SPDK_TRACE_DEBUG, "spdk_json_decode_object failed\n");
+		SPDK_DEBUGLOG(SPDK_LOG_NET, "spdk_json_decode_object failed\n");
 		goto invalid;
 	}
 
@@ -88,7 +90,7 @@ invalid:
 	spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_INVALID_PARAMS, "Invalid parameters");
 	free_rpc_ip_address(&req);
 }
-SPDK_RPC_REGISTER("add_ip_address", spdk_rpc_add_ip_address)
+SPDK_RPC_REGISTER("add_ip_address", spdk_rpc_add_ip_address, SPDK_RPC_RUNTIME)
 
 static void
 spdk_rpc_delete_ip_address(struct spdk_jsonrpc_request *request,
@@ -100,7 +102,7 @@ spdk_rpc_delete_ip_address(struct spdk_jsonrpc_request *request,
 	if (spdk_json_decode_object(params, rpc_ip_address_decoders,
 				    SPDK_COUNTOF(rpc_ip_address_decoders),
 				    &req)) {
-		SPDK_TRACELOG(SPDK_TRACE_DEBUG, "spdk_json_decode_object failed\n");
+		SPDK_DEBUGLOG(SPDK_LOG_NET, "spdk_json_decode_object failed\n");
 		goto invalid;
 	}
 
@@ -123,7 +125,7 @@ invalid:
 	spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_INVALID_PARAMS, "Invalid parameters");
 	free_rpc_ip_address(&req);
 }
-SPDK_RPC_REGISTER("delete_ip_address", spdk_rpc_delete_ip_address)
+SPDK_RPC_REGISTER("delete_ip_address", spdk_rpc_delete_ip_address, SPDK_RPC_RUNTIME)
 
 static void
 spdk_rpc_get_interfaces(struct spdk_jsonrpc_request *request,
@@ -173,4 +175,6 @@ spdk_rpc_get_interfaces(struct spdk_jsonrpc_request *request,
 
 	spdk_jsonrpc_end_result(request, w);
 }
-SPDK_RPC_REGISTER("get_interfaces", spdk_rpc_get_interfaces)
+SPDK_RPC_REGISTER("get_interfaces", spdk_rpc_get_interfaces, SPDK_RPC_RUNTIME)
+
+SPDK_LOG_REGISTER_COMPONENT("net", SPDK_LOG_NET)

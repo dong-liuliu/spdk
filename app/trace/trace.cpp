@@ -123,7 +123,7 @@ print_size(uint32_t size)
 static void
 print_object_id(uint8_t type, uint64_t id)
 {
-	printf("id:    %c%-15jd ", g_histories->object[type].id_prefix, id);
+	printf("id:    %c%-15jd ", g_histories->flags.object[type].id_prefix, id);
 }
 
 static void
@@ -135,13 +135,15 @@ print_float(const char *arg_string, float arg)
 static void
 print_arg(bool arg_is_ptr, const char *arg_string, uint64_t arg)
 {
-	if (arg_string[0] == 0)
+	if (arg_string[0] == 0) {
 		return;
+	}
 
-	if (arg_is_ptr)
+	if (arg_is_ptr) {
 		print_ptr(arg_string, arg);
-	else
+	} else {
 		print_uint64(arg_string, arg);
+	}
 }
 
 static void
@@ -152,7 +154,7 @@ print_event(struct spdk_trace_entry *e, uint64_t tsc_rate,
 	struct object_stats		*stats;
 	float				us;
 
-	d = &g_histories->tpoint[e->tpoint_id];
+	d = &g_histories->flags.tpoint[e->tpoint_id];
 	stats = &g_stats[d->object_type];
 
 	if (d->new_object) {
@@ -171,8 +173,8 @@ print_event(struct spdk_trace_entry *e, uint64_t tsc_rate,
 	us = get_us_from_tsc(e->tsc - tsc_offset, tsc_rate);
 
 	printf("%2d: %10.3f (%9ju) ", lcore, us, e->tsc - tsc_offset);
-	if (g_histories->owner[d->owner_type].id_prefix) {
-		printf("%c%02d ", g_histories->owner[d->owner_type].id_prefix, e->poller_id);
+	if (g_histories->flags.owner[d->owner_type].id_prefix) {
+		printf("%c%02d ", g_histories->flags.owner[d->owner_type].id_prefix, e->poller_id);
 	} else {
 		printf("%4s", " ");
 	}
@@ -191,7 +193,7 @@ print_event(struct spdk_trace_entry *e, uint64_t tsc_rate,
 					     tsc_rate);
 			print_object_id(d->object_type, stats->index[e->object_id]);
 			print_float("time:", us);
-			start_description = &g_histories->tpoint[stats->tpoint_id[e->object_id]];
+			start_description = &g_histories->flags.tpoint[stats->tpoint_id[e->object_id]];
 			if (start_description->short_name[0] != 0) {
 				printf(" (%.4s)", start_description->short_name);
 			}
@@ -236,19 +238,23 @@ populate_events(struct spdk_trace_history *history)
 	if (num_entries == num_entries_filled) {
 		first = last = 0;
 		for (i = 1; i < num_entries; i++) {
-			if (e[i].tsc < e[first].tsc)
+			if (e[i].tsc < e[first].tsc) {
 				first = i;
-			if (e[i].tsc > e[last].tsc)
+			}
+			if (e[i].tsc > e[last].tsc) {
 				last = i;
+			}
 		}
 
 		first += g_fudge_factor;
-		if (first >= num_entries)
+		if (first >= num_entries) {
 			first -= num_entries;
+		}
 
 		last -= g_fudge_factor;
-		if (last < 0)
+		if (last < 0) {
 			last += num_entries;
+		}
 	} else {
 		first = 0;
 		last = num_entries_filled - 1;
@@ -364,7 +370,7 @@ int main(int argc, char **argv)
 
 	g_histories = (struct spdk_trace_histories *)history_ptr;
 
-	tsc_rate = g_histories->tsc_rate;
+	tsc_rate = g_histories->flags.tsc_rate;
 	if (tsc_rate == 0) {
 		fprintf(stderr, "Invalid tsc_rate %ju\n", tsc_rate);
 		usage();

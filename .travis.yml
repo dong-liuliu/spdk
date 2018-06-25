@@ -13,21 +13,25 @@ addons:
       - libcunit1-dev
       - libaio-dev
       - libssl-dev
+      - uuid-dev
+      - libnuma-dev
 
 before_script:
-  - export MAKEFLAGS="-j$(nproc)"
-  - if [ "$CC" = gcc ]; then
-      wget https://downloads.sourceforge.net/project/astyle/astyle/astyle%203.0/astyle_3.0_linux.tar.gz;
-      tar xf astyle_3.0_linux.tar.gz;
-      pushd astyle/build/gcc;
-      make;
-      export PATH=$PWD/bin:$PATH;
-      popd;
-    fi
   - git submodule update --init
+  - export MAKEFLAGS="-j$(nproc)"
 
 script:
   - ./scripts/check_format.sh
   - ./configure --enable-werror
   - make
-  - ./unittest.sh
+  - ./test/unit/unittest.sh
+
+notifications:
+  irc:
+    channels:
+      - "chat.freenode.net#spdk"
+    template:
+      - "(%{repository_name}/%{branch}) %{commit_subject} (%{author})"
+      - "Diff URL: %{compare_url}"
+    on_success: always
+    on_failure: always

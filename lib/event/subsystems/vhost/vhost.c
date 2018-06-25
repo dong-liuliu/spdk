@@ -47,11 +47,25 @@ spdk_vhost_subsystem_init(void)
 	spdk_subsystem_init_next(rc);
 }
 
-static int
-spdk_vhost_subsystem_fini(void)
+static void
+spdk_vhost_subsystem_fini_done(void)
 {
-	return spdk_vhost_fini();
+	spdk_subsystem_fini_next();
 }
 
-SPDK_SUBSYSTEM_REGISTER(vhost, spdk_vhost_subsystem_init, spdk_vhost_subsystem_fini, NULL)
+static void
+spdk_vhost_subsystem_fini(void)
+{
+	spdk_vhost_fini(spdk_vhost_subsystem_fini_done);
+}
+
+static struct spdk_subsystem g_spdk_subsystem_vhost = {
+	.name = "vhost",
+	.init = spdk_vhost_subsystem_init,
+	.fini = spdk_vhost_subsystem_fini,
+	.config = NULL,
+	.write_config_json = spdk_vhost_config_json,
+};
+
+SPDK_SUBSYSTEM_REGISTER(g_spdk_subsystem_vhost);
 SPDK_SUBSYSTEM_DEPEND(vhost, scsi)

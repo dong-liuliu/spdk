@@ -41,7 +41,7 @@
 /**
  * Major version number (year of original release minus 2000).
  */
-#define SPDK_VERSION_MAJOR	17
+#define SPDK_VERSION_MAJOR	18
 
 /**
  * Minor version number (month of original release).
@@ -101,7 +101,7 @@
  * Human-readable version string.
  */
 #define SPDK_VERSION_STRING	\
-	"SPDK " \
+	"SPDK v" \
 	SPDK_VERSION_MAJOR_STRING \
 	SPDK_VERSION_MINOR_STRING \
 	SPDK_VERSION_PATCH_STRING \

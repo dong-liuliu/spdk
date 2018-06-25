@@ -32,27 +32,21 @@
  */
 
 #include "spdk/stdinc.h"
+#include "spdk/likely.h"
 
 #include "spdk_internal/event.h"
-
-#ifdef __linux__
-#include <sys/prctl.h>
-#endif
-
-#ifdef __FreeBSD__
-#include <pthread_np.h>
-#endif
+#include "spdk_internal/log.h"
 
 #include "spdk/log.h"
-#include "spdk/io_channel.h"
+#include "spdk/thread.h"
 #include "spdk/env.h"
+#include "spdk/util.h"
 
 #define SPDK_MAX_SOCKET		64
 
-#define SPDK_MAX_REACTORS		128
-#define SPDK_REACTOR_SPIN_TIME_US	1000
-#define SPDK_TIMER_POLL_ITERATIONS	5
+#define SPDK_REACTOR_SPIN_TIME_USEC	1000
 #define SPDK_EVENT_BATCH_SIZE		8
+#define SPDK_SEC_TO_USEC		1000000ULL
 
 enum spdk_poller_state {
 	/* The poller is registered with a reactor but not currently executing its fn. */
@@ -76,8 +70,6 @@ struct spdk_poller {
 	uint64_t			next_run_tick;
 	spdk_poller_fn			fn;
 	void				*arg;
-
-	struct spdk_event		*unregister_complete_event;
 };
 
 enum spdk_reactor_state {
@@ -94,6 +86,17 @@ struct spdk_reactor {
 
 	/* Socket ID for this reactor. */
 	uint32_t					socket_id;
+
+	/* Poller for get the rusage for the reactor. */
+	struct spdk_poller				*rusage_poller;
+
+	/* Reactor tsc stats */
+	struct spdk_reactor_tsc_stats			tsc_stats;
+
+	uint64_t					tsc_last;
+
+	/* The last known rusage values */
+	struct rusage					rusage;
 
 	/*
 	 * Contains pollers actively running on this reactor.  Pollers
@@ -116,20 +119,24 @@ struct spdk_reactor {
 	uint64_t					max_delay_us;
 } __attribute__((aligned(64)));
 
-static struct spdk_reactor g_reactors[SPDK_MAX_REACTORS];
+static struct spdk_reactor *g_reactors;
 
 static enum spdk_reactor_state	g_reactor_state = SPDK_REACTOR_STATE_INVALID;
+
+static bool g_context_switch_monitor_enabled = true;
 
 static void spdk_reactor_construct(struct spdk_reactor *w, uint32_t lcore,
 				   uint64_t max_delay_us);
 
 static struct spdk_mempool *g_spdk_event_mempool[SPDK_MAX_SOCKET];
 
+static struct spdk_cpuset *g_spdk_app_core_mask;
+
 static struct spdk_reactor *
 spdk_reactor_get(uint32_t lcore)
 {
 	struct spdk_reactor *reactor;
-	reactor = &g_reactors[lcore];
+	reactor = spdk_likely(g_reactors) ? &g_reactors[lcore] : NULL;
 	return reactor;
 }
 
@@ -138,6 +145,11 @@ spdk_event_allocate(uint32_t lcore, spdk_event_fn fn, void *arg1, void *arg2)
 {
 	struct spdk_event *event = NULL;
 	struct spdk_reactor *reactor = spdk_reactor_get(lcore);
+
+	if (!reactor) {
+		assert(false);
+		return NULL;
+	}
 
 	event = spdk_mempool_get(reactor->event_mempool);
 	if (event == NULL) {
@@ -200,29 +212,29 @@ _spdk_event_queue_run_batch(struct spdk_reactor *reactor)
 	return count;
 }
 
-/**
- *
- * \brief Set current reactor thread name to "reactor <cpu #>".
- *
- * This makes the reactor threads distinguishable in top and gdb.
- */
-static void set_reactor_thread_name(uint32_t lcore)
+static void
+_spdk_reactor_msg_passed(void *arg1, void *arg2)
 {
-	char thread_name[16];
+	spdk_thread_fn fn = arg1;
 
-	snprintf(thread_name, sizeof(thread_name), "reactor_%u", lcore);
-
-#if defined(__linux__)
-	prctl(PR_SET_NAME, thread_name, 0, 0, 0);
-#elif defined(__FreeBSD__)
-	pthread_set_name_np(pthread_self(), thread_name);
-#else
-#error missing platform support for thread name
-#endif
+	fn(arg2);
 }
 
 static void
-spdk_poller_insert_timer(struct spdk_reactor *reactor, struct spdk_poller *poller, uint64_t now)
+_spdk_reactor_send_msg(spdk_thread_fn fn, void *ctx, void *thread_ctx)
+{
+	struct spdk_event *event;
+	struct spdk_reactor *reactor;
+
+	reactor = thread_ctx;
+
+	event = spdk_event_allocate(reactor->lcore, _spdk_reactor_msg_passed, fn, ctx);
+
+	spdk_event_call(event);
+}
+
+static void
+_spdk_poller_insert_timer(struct spdk_reactor *reactor, struct spdk_poller *poller, uint64_t now)
 {
 	struct spdk_poller *iter;
 	uint64_t next_run_tick;
@@ -245,35 +257,195 @@ spdk_poller_insert_timer(struct spdk_reactor *reactor, struct spdk_poller *polle
 	TAILQ_INSERT_HEAD(&reactor->timer_pollers, poller, tailq);
 }
 
-static void
-_spdk_poller_unregister_complete(struct spdk_poller *poller)
+static struct spdk_poller *
+_spdk_reactor_start_poller(void *thread_ctx,
+			   spdk_poller_fn fn,
+			   void *arg,
+			   uint64_t period_microseconds)
 {
-	if (poller->unregister_complete_event) {
-		spdk_event_call(poller->unregister_complete_event);
+	struct spdk_poller *poller;
+	struct spdk_reactor *reactor;
+	uint64_t quotient, remainder, ticks;
+
+	reactor = thread_ctx;
+
+	poller = calloc(1, sizeof(*poller));
+	if (poller == NULL) {
+		SPDK_ERRLOG("Poller memory allocation failed\n");
+		return NULL;
 	}
 
-	free(poller);
+	poller->lcore = reactor->lcore;
+	poller->state = SPDK_POLLER_STATE_WAITING;
+	poller->fn = fn;
+	poller->arg = arg;
+
+	if (period_microseconds) {
+		quotient = period_microseconds / SPDK_SEC_TO_USEC;
+		remainder = period_microseconds % SPDK_SEC_TO_USEC;
+		ticks = spdk_get_ticks_hz();
+
+		poller->period_ticks = ticks * quotient + (ticks * remainder) / SPDK_SEC_TO_USEC;
+	} else {
+		poller->period_ticks = 0;
+	}
+
+	if (poller->period_ticks) {
+		_spdk_poller_insert_timer(reactor, poller, spdk_get_ticks());
+	} else {
+		TAILQ_INSERT_TAIL(&reactor->active_pollers, poller, tailq);
+	}
+
+	return poller;
 }
 
 static void
-_spdk_reactor_msg_passed(void *arg1, void *arg2)
+_spdk_reactor_stop_poller(struct spdk_poller *poller, void *thread_ctx)
 {
-	spdk_thread_fn fn = arg1;
+	struct spdk_reactor *reactor;
 
-	fn(arg2);
+	reactor = thread_ctx;
+
+	assert(poller->lcore == spdk_env_get_current_core());
+
+	if (poller->state == SPDK_POLLER_STATE_RUNNING) {
+		/*
+		 * We are being called from the poller_fn, so set the state to unregistered
+		 * and let the reactor loop free the poller.
+		 */
+		poller->state = SPDK_POLLER_STATE_UNREGISTERED;
+	} else {
+		/* Poller is not running currently, so just free it. */
+		if (poller->period_ticks) {
+			TAILQ_REMOVE(&reactor->timer_pollers, poller, tailq);
+		} else {
+			TAILQ_REMOVE(&reactor->active_pollers, poller, tailq);
+		}
+
+		free(poller);
+	}
+}
+
+static int
+get_rusage(void *arg)
+{
+	struct spdk_reactor	*reactor = arg;
+	struct rusage		rusage;
+
+	if (getrusage(RUSAGE_THREAD, &rusage) != 0) {
+		return -1;
+	}
+
+	if (rusage.ru_nvcsw != reactor->rusage.ru_nvcsw || rusage.ru_nivcsw != reactor->rusage.ru_nivcsw) {
+		SPDK_INFOLOG(SPDK_LOG_REACTOR,
+			     "Reactor %d: %ld voluntary context switches and %ld involuntary context switches in the last second.\n",
+			     reactor->lcore, rusage.ru_nvcsw - reactor->rusage.ru_nvcsw,
+			     rusage.ru_nivcsw - reactor->rusage.ru_nivcsw);
+	}
+	reactor->rusage = rusage;
+
+	return -1;
 }
 
 static void
-_spdk_reactor_send_msg(spdk_thread_fn fn, void *ctx, void *thread_ctx)
+_spdk_reactor_context_switch_monitor_start(void *arg1, void *arg2)
 {
+	struct spdk_reactor *reactor = arg1;
+
+	if (reactor->rusage_poller == NULL) {
+		getrusage(RUSAGE_THREAD, &reactor->rusage);
+		reactor->rusage_poller = spdk_poller_register(get_rusage, reactor, 1000000);
+	}
+}
+
+static void
+_spdk_reactor_context_switch_monitor_stop(void *arg1, void *arg2)
+{
+	struct spdk_reactor *reactor = arg1;
+
+	if (reactor->rusage_poller != NULL) {
+		spdk_poller_unregister(&reactor->rusage_poller);
+	}
+}
+
+static size_t
+_spdk_reactor_get_max_event_cnt(uint8_t socket_count)
+{
+	size_t cnt;
+
+	/* Try to make event ring fill at most 2MB of memory,
+	 * as some ring implementations may require physical address
+	 * contingency. We don't want to introduce a requirement of
+	 * at least 2 physically contiguous 2MB hugepages.
+	 */
+	cnt = spdk_min(262144 / socket_count, 262144 / 2);
+	/* Take into account one extra element required by
+	 * some ring implementations.
+	 */
+	cnt -= 1;
+	return cnt;
+}
+
+void
+spdk_reactor_enable_context_switch_monitor(bool enable)
+{
+	struct spdk_reactor *reactor;
+	spdk_event_fn fn;
 	uint32_t core;
-	struct spdk_event *event;
 
-	core = *(uint32_t *)thread_ctx;
+	if (enable != g_context_switch_monitor_enabled) {
+		g_context_switch_monitor_enabled = enable;
+		if (enable) {
+			fn = _spdk_reactor_context_switch_monitor_start;
+		} else {
+			fn = _spdk_reactor_context_switch_monitor_stop;
+		}
+		SPDK_ENV_FOREACH_CORE(core) {
+			reactor = spdk_reactor_get(core);
+			spdk_event_call(spdk_event_allocate(core, fn, reactor, NULL));
+		}
+	}
+}
 
-	event = spdk_event_allocate(core, _spdk_reactor_msg_passed, fn, ctx);
+bool
+spdk_reactor_context_switch_monitor_enabled(void)
+{
+	return g_context_switch_monitor_enabled;
+}
 
-	spdk_event_call(event);
+static void
+spdk_reactor_add_tsc_stats(void *arg, int rc, uint64_t now)
+{
+	struct spdk_reactor *reactor = arg;
+	struct spdk_reactor_tsc_stats *tsc_stats = &reactor->tsc_stats;
+
+	if (rc == 0) {
+		/* Poller status idle */
+		tsc_stats->idle_tsc += now - reactor->tsc_last;
+	} else if (rc == 1) {
+		/* Poller status busy */
+		tsc_stats->busy_tsc += now - reactor->tsc_last;
+	} else {
+		/* Poller status unknown */
+		tsc_stats->unknown_tsc += now - reactor->tsc_last;
+	}
+
+	reactor->tsc_last = now;
+}
+
+int
+spdk_reactor_get_tsc_stats(struct spdk_reactor_tsc_stats *tsc_stats, uint32_t core)
+{
+	struct spdk_reactor *reactor;
+
+	if (!spdk_cpuset_get_cpu(g_spdk_app_core_mask, core)) {
+		return -1;
+	}
+
+	reactor = spdk_reactor_get(core);
+	*tsc_stats = reactor->tsc_stats;
+
+	return 0;
 }
 
 /**
@@ -292,7 +464,7 @@ _spdk_reactor_send_msg(spdk_thread_fn fn, void *ctx, void *thread_ctx)
  *	if (first timer poller has expired)
  *		run the first timer poller and reinsert it in the timer list
  *
- *	if (idle for at least SPDK_REACTOR_SPIN_TIME_US)
+ *	if (idle for at least SPDK_REACTOR_SPIN_TIME_USEC)
  *		sleep until next timer poller is scheduled to expire
  * \endcode
  *
@@ -306,23 +478,36 @@ _spdk_reactor_run(void *arg)
 	uint64_t		idle_started, now;
 	uint64_t		spin_cycles, sleep_cycles;
 	uint32_t		sleep_us;
-	uint32_t 		timer_poll_count;
+	int			rc = -1;
+	char			thread_name[32];
 
-	spdk_allocate_thread(_spdk_reactor_send_msg, &reactor->lcore);
-	set_reactor_thread_name(reactor->lcore);
+	snprintf(thread_name, sizeof(thread_name), "reactor_%u", reactor->lcore);
+	if (spdk_allocate_thread(_spdk_reactor_send_msg,
+				 _spdk_reactor_start_poller,
+				 _spdk_reactor_stop_poller,
+				 reactor, thread_name) == NULL) {
+		return -1;
+	}
 	SPDK_NOTICELOG("Reactor started on core %u on socket %u\n", reactor->lcore,
 		       reactor->socket_id);
 
-	spin_cycles = SPDK_REACTOR_SPIN_TIME_US * spdk_get_ticks_hz() / 1000000ULL;
-	sleep_cycles = reactor->max_delay_us * spdk_get_ticks_hz() / 1000000ULL;
+	spin_cycles = SPDK_REACTOR_SPIN_TIME_USEC * spdk_get_ticks_hz() / SPDK_SEC_TO_USEC;
+	sleep_cycles = reactor->max_delay_us * spdk_get_ticks_hz() / SPDK_SEC_TO_USEC;
 	idle_started = 0;
-	timer_poll_count = 0;
+	if (g_context_switch_monitor_enabled) {
+		_spdk_reactor_context_switch_monitor_start(reactor, NULL);
+	}
+	now = spdk_get_ticks();
+	reactor->tsc_last = now;
 
 	while (1) {
 		bool took_action = false;
 
 		event_count = _spdk_event_queue_run_batch(reactor);
 		if (event_count > 0) {
+			rc = 1;
+			now = spdk_get_ticks();
+			spdk_reactor_add_tsc_stats(reactor, rc, now);
 			took_action = true;
 		}
 
@@ -330,9 +515,11 @@ _spdk_reactor_run(void *arg)
 		if (poller) {
 			TAILQ_REMOVE(&reactor->active_pollers, poller, tailq);
 			poller->state = SPDK_POLLER_STATE_RUNNING;
-			poller->fn(poller->arg);
+			rc = poller->fn(poller->arg);
+			now = spdk_get_ticks();
+			spdk_reactor_add_tsc_stats(reactor, rc, now);
 			if (poller->state == SPDK_POLLER_STATE_UNREGISTERED) {
-				_spdk_poller_unregister_complete(poller);
+				free(poller);
 			} else {
 				poller->state = SPDK_POLLER_STATE_WAITING;
 				TAILQ_INSERT_TAIL(&reactor->active_pollers, poller, tailq);
@@ -340,27 +527,32 @@ _spdk_reactor_run(void *arg)
 			took_action = true;
 		}
 
-		if (timer_poll_count >= SPDK_TIMER_POLL_ITERATIONS) {
-			poller = TAILQ_FIRST(&reactor->timer_pollers);
-			if (poller) {
+		poller = TAILQ_FIRST(&reactor->timer_pollers);
+		if (poller) {
+			if (took_action == false) {
 				now = spdk_get_ticks();
-
-				if (now >= poller->next_run_tick) {
-					TAILQ_REMOVE(&reactor->timer_pollers, poller, tailq);
-					poller->state = SPDK_POLLER_STATE_RUNNING;
-					poller->fn(poller->arg);
-					if (poller->state == SPDK_POLLER_STATE_UNREGISTERED) {
-						_spdk_poller_unregister_complete(poller);
-					} else {
-						poller->state = SPDK_POLLER_STATE_WAITING;
-						spdk_poller_insert_timer(reactor, poller, now);
-					}
-					took_action = true;
-				}
 			}
-			timer_poll_count = 0;
-		} else {
-			timer_poll_count++;
+
+			if (now >= poller->next_run_tick) {
+				uint64_t tmp_timer_tsc;
+
+				TAILQ_REMOVE(&reactor->timer_pollers, poller, tailq);
+				poller->state = SPDK_POLLER_STATE_RUNNING;
+				rc = poller->fn(poller->arg);
+				/* Save the tsc value from before poller->fn was executed. We want to
+				 * use the current time for idle/busy tsc value accounting, but want to
+				 * use the older time to reinsert to the timer poller below. */
+				tmp_timer_tsc = now;
+				now = spdk_get_ticks();
+				spdk_reactor_add_tsc_stats(reactor, rc, now);
+				if (poller->state == SPDK_POLLER_STATE_UNREGISTERED) {
+					free(poller);
+				} else {
+					poller->state = SPDK_POLLER_STATE_WAITING;
+					_spdk_poller_insert_timer(reactor, poller, tmp_timer_tsc);
+				}
+				took_action = true;
+			}
 		}
 
 		if (took_action) {
@@ -385,7 +577,8 @@ _spdk_reactor_run(void *arg)
 						if (poller->next_run_tick <= now) {
 							sleep_us = 0;
 						} else {
-							sleep_us = ((poller->next_run_tick - now) * 1000000ULL) / spdk_get_ticks_hz();
+							sleep_us = ((poller->next_run_tick - now) *
+								    SPDK_SEC_TO_USEC) / spdk_get_ticks_hz();
 						}
 					}
 				}
@@ -394,8 +587,6 @@ _spdk_reactor_run(void *arg)
 					usleep(sleep_us);
 				}
 
-				/* After sleeping, always poll for timers */
-				timer_poll_count = SPDK_TIMER_POLL_ITERATIONS;
 			}
 		}
 
@@ -404,6 +595,7 @@ _spdk_reactor_run(void *arg)
 		}
 	}
 
+	_spdk_reactor_context_switch_monitor_stop(reactor, NULL);
 	spdk_free_thread();
 	return 0;
 }
@@ -420,64 +612,39 @@ spdk_reactor_construct(struct spdk_reactor *reactor, uint32_t lcore, uint64_t ma
 	TAILQ_INIT(&reactor->timer_pollers);
 
 	reactor->events = spdk_ring_create(SPDK_RING_TYPE_MP_SC, 65536, reactor->socket_id);
+	if (!reactor->events) {
+		SPDK_NOTICELOG("Ring creation failed on preferred socket %d. Try other sockets.\n",
+			       reactor->socket_id);
+
+		reactor->events = spdk_ring_create(SPDK_RING_TYPE_MP_SC, 65536,
+						   SPDK_ENV_SOCKET_ID_ANY);
+	}
 	assert(reactor->events != NULL);
 
 	reactor->event_mempool = g_spdk_event_mempool[reactor->socket_id];
 }
 
 int
-spdk_app_get_core_count(void)
+spdk_app_parse_core_mask(const char *mask, struct spdk_cpuset *cpumask)
 {
-	return spdk_env_get_core_count();
-}
+	int ret;
+	struct spdk_cpuset *validmask;
 
-uint32_t
-spdk_app_get_current_core(void)
-{
-	return spdk_env_get_current_core();
-}
-
-int
-spdk_app_parse_core_mask(const char *mask, uint64_t *cpumask)
-{
-	uint32_t i;
-	char *end;
-	uint64_t validmask;
-
-	if (mask == NULL || cpumask == NULL) {
-		return -1;
+	ret = spdk_cpuset_parse(cpumask, mask);
+	if (ret < 0) {
+		return ret;
 	}
 
-	errno = 0;
-	*cpumask = strtoull(mask, &end, 16);
-	if (*end != '\0' || errno) {
-		return -1;
-	}
-
-	validmask = 0;
-	SPDK_ENV_FOREACH_CORE(i) {
-		if (i >= 64) {
-			break;
-		}
-		validmask |= 1ULL << i;
-	}
-
-	*cpumask &= validmask;
+	validmask = spdk_app_get_core_mask();
+	spdk_cpuset_and(cpumask, validmask);
 
 	return 0;
 }
 
-uint64_t
+struct spdk_cpuset *
 spdk_app_get_core_mask(void)
 {
-	uint32_t i;
-	uint64_t mask = 0;
-
-	SPDK_ENV_FOREACH_CORE(i) {
-		mask |= 1ULL << i;
-	}
-
-	return mask;
+	return g_spdk_app_core_mask;
 }
 
 
@@ -504,6 +671,7 @@ spdk_reactors_start(void)
 	int rc;
 
 	g_reactor_state = SPDK_REACTOR_STATE_RUNNING;
+	g_spdk_app_core_mask = spdk_cpuset_alloc();
 
 	current_core = spdk_env_get_current_core();
 	SPDK_ENV_FOREACH_CORE(i) {
@@ -516,6 +684,7 @@ spdk_reactors_start(void)
 				return;
 			}
 		}
+		spdk_cpuset_set_cpu(g_spdk_app_core_mask, i, true);
 	}
 
 	/* Start the master reactor */
@@ -525,9 +694,12 @@ spdk_reactors_start(void)
 	spdk_env_thread_wait_all();
 
 	g_reactor_state = SPDK_REACTOR_STATE_SHUTDOWN;
+	spdk_cpuset_free(g_spdk_app_core_mask);
+	g_spdk_app_core_mask = NULL;
 }
 
-void spdk_reactors_stop(void)
+void
+spdk_reactors_stop(void *arg1, void *arg2)
 {
 	g_reactor_state = SPDK_REACTOR_STATE_EXITING;
 }
@@ -535,14 +707,15 @@ void spdk_reactors_stop(void)
 int
 spdk_reactors_init(unsigned int max_delay_us)
 {
-	uint32_t i, j;
+	int rc;
+	uint32_t i, j, last_core;
 	struct spdk_reactor *reactor;
 	uint64_t socket_mask = 0x0;
 	uint8_t socket_count = 0;
 	char mempool_name[32];
 
 	socket_mask = spdk_reactor_get_socket_mask();
-	printf("Occupied cpu socket mask is 0x%lx\n", socket_mask);
+	SPDK_NOTICELOG("Occupied cpu socket mask is 0x%lx\n", socket_mask);
 
 	for (i = 0; i < SPDK_MAX_SOCKET; i++) {
 		if ((1ULL << i) & socket_mask) {
@@ -550,7 +723,7 @@ spdk_reactors_init(unsigned int max_delay_us)
 		}
 	}
 	if (socket_count == 0) {
-		printf("No sockets occupied (internal error)\n");
+		SPDK_ERRLOG("No sockets occupied (internal error)\n");
 		return -1;
 	}
 
@@ -558,11 +731,12 @@ spdk_reactors_init(unsigned int max_delay_us)
 		if ((1ULL << i) & socket_mask) {
 			snprintf(mempool_name, sizeof(mempool_name), "evtpool%d_%d", i, getpid());
 			g_spdk_event_mempool[i] = spdk_mempool_create(mempool_name,
-						  (262144 / socket_count),
-						  sizeof(struct spdk_event), -1, i);
+						  _spdk_reactor_get_max_event_cnt(socket_count),
+						  sizeof(struct spdk_event),
+						  SPDK_MEMPOOL_DEFAULT_CACHE_SIZE, i);
 
 			if (g_spdk_event_mempool[i] == NULL) {
-				SPDK_ERRLOG("spdk_event_mempool creation failed on socket %d\n", i);
+				SPDK_NOTICELOG("Event_mempool creation failed on preferred socket %d.\n", i);
 
 				/*
 				 * Instead of failing the operation directly, try to create
@@ -572,8 +746,9 @@ spdk_reactors_init(unsigned int max_delay_us)
 				 */
 				g_spdk_event_mempool[i] = spdk_mempool_create(
 								  mempool_name,
-								  (262144 / socket_count),
-								  sizeof(struct spdk_event), -1,
+								  _spdk_reactor_get_max_event_cnt(socket_count),
+								  sizeof(struct spdk_event),
+								  SPDK_MEMPOOL_DEFAULT_CACHE_SIZE,
 								  SPDK_ENV_SOCKET_ID_ANY);
 
 				if (g_spdk_event_mempool[i] == NULL) {
@@ -586,8 +761,27 @@ spdk_reactors_init(unsigned int max_delay_us)
 					return -1;
 				}
 			}
+		} else {
+			g_spdk_event_mempool[i] = NULL;
 		}
 	}
+
+	/* struct spdk_reactor must be aligned on 64 byte boundary */
+	last_core = spdk_env_get_last_core();
+	rc = posix_memalign((void **)&g_reactors, 64,
+			    (last_core + 1) * sizeof(struct spdk_reactor));
+	if (rc != 0) {
+		SPDK_ERRLOG("Could not allocate array size=%u for g_reactors\n",
+			    last_core + 1);
+		for (i = 0; i < SPDK_MAX_SOCKET; i++) {
+			if (g_spdk_event_mempool[i] != NULL) {
+				spdk_mempool_free(g_spdk_event_mempool[i]);
+			}
+		}
+		return -1;
+	}
+
+	memset(g_reactors, 0, (last_core + 1) * sizeof(struct spdk_reactor));
 
 	SPDK_ENV_FOREACH_CORE(i) {
 		reactor = spdk_reactor_get(i);
@@ -599,170 +793,27 @@ spdk_reactors_init(unsigned int max_delay_us)
 	return 0;
 }
 
-int
+void
 spdk_reactors_fini(void)
 {
 	uint32_t i;
-	uint64_t socket_mask;
 	struct spdk_reactor *reactor;
 
 	SPDK_ENV_FOREACH_CORE(i) {
 		reactor = spdk_reactor_get(i);
-		if (reactor->events != NULL) {
+		if (spdk_likely(reactor != NULL) && reactor->events != NULL) {
 			spdk_ring_free(reactor->events);
 		}
 	}
 
-	socket_mask = spdk_reactor_get_socket_mask();
 	for (i = 0; i < SPDK_MAX_SOCKET; i++) {
-		if ((1ULL << i) & socket_mask && g_spdk_event_mempool[i] != NULL) {
+		if (g_spdk_event_mempool[i] != NULL) {
 			spdk_mempool_free(g_spdk_event_mempool[i]);
 		}
 	}
 
-	return 0;
+	free(g_reactors);
+	g_reactors = NULL;
 }
 
-static void
-_spdk_poller_register(struct spdk_reactor *reactor, struct spdk_poller *poller)
-{
-	if (poller->period_ticks) {
-		spdk_poller_insert_timer(reactor, poller, spdk_get_ticks());
-	} else {
-		TAILQ_INSERT_TAIL(&reactor->active_pollers, poller, tailq);
-	}
-}
-
-static void
-_spdk_event_add_poller(void *arg1, void *arg2)
-{
-	struct spdk_reactor *reactor = arg1;
-	struct spdk_poller *poller = arg2;
-
-	_spdk_poller_register(reactor, poller);
-}
-
-void
-spdk_poller_register(struct spdk_poller **ppoller, spdk_poller_fn fn, void *arg,
-		     uint32_t lcore, uint64_t period_microseconds)
-{
-	struct spdk_poller *poller;
-	struct spdk_reactor *reactor;
-
-	poller = calloc(1, sizeof(*poller));
-	if (poller == NULL) {
-		SPDK_ERRLOG("Poller memory allocation failed\n");
-		abort();
-	}
-
-	poller->lcore = lcore;
-	poller->state = SPDK_POLLER_STATE_WAITING;
-	poller->fn = fn;
-	poller->arg = arg;
-
-	if (period_microseconds) {
-		poller->period_ticks = (spdk_get_ticks_hz() * period_microseconds) / 1000000ULL;
-	} else {
-		poller->period_ticks = 0;
-	}
-
-	if (*ppoller != NULL) {
-		SPDK_ERRLOG("Attempted reuse of poller pointer\n");
-		abort();
-	}
-
-	if (lcore >= SPDK_MAX_REACTORS) {
-		SPDK_ERRLOG("Attempted to use lcore %u which is larger than max lcore %u\n",
-			    lcore, SPDK_MAX_REACTORS - 1);
-		abort();
-	}
-
-	*ppoller = poller;
-	reactor = spdk_reactor_get(lcore);
-
-	if (lcore == spdk_env_get_current_core()) {
-		/*
-		 * The poller is registered to run on the current core, so call the add function
-		 * directly.
-		 */
-		_spdk_poller_register(reactor, poller);
-	} else {
-		/*
-		 * The poller is registered to run on a different core.
-		 * Schedule an event to run on the poller's core that will add the poller.
-		 */
-		spdk_event_call(spdk_event_allocate(lcore, _spdk_event_add_poller, reactor, poller));
-	}
-}
-
-static void
-_spdk_poller_unregister(struct spdk_reactor *reactor, struct spdk_poller *poller,
-			struct spdk_event *next)
-{
-	assert(poller->lcore == reactor->lcore);
-	assert(poller->lcore == spdk_env_get_current_core());
-
-	poller->unregister_complete_event = next;
-
-	if (poller->state == SPDK_POLLER_STATE_RUNNING) {
-		/*
-		 * We are being called from the poller_fn, so set the state to unregistered
-		 * and let the reactor loop free the poller.
-		 */
-		poller->state = SPDK_POLLER_STATE_UNREGISTERED;
-	} else {
-		/* Poller is not running currently, so just free it. */
-		if (poller->period_ticks) {
-			TAILQ_REMOVE(&reactor->timer_pollers, poller, tailq);
-		} else {
-			TAILQ_REMOVE(&reactor->active_pollers, poller, tailq);
-		}
-
-		_spdk_poller_unregister_complete(poller);
-	}
-}
-
-static void
-_spdk_event_remove_poller(void *arg1, void *arg2)
-{
-	struct spdk_poller *poller = arg1;
-	struct spdk_reactor *reactor = spdk_reactor_get(poller->lcore);
-	struct spdk_event *next = arg2;
-
-	_spdk_poller_unregister(reactor, poller, next);
-}
-
-void
-spdk_poller_unregister(struct spdk_poller **ppoller,
-		       struct spdk_event *complete)
-{
-	struct spdk_poller *poller;
-	uint32_t lcore;
-
-	poller = *ppoller;
-
-	*ppoller = NULL;
-
-	if (poller == NULL) {
-		if (complete) {
-			spdk_event_call(complete);
-		}
-		return;
-	}
-
-	lcore = poller->lcore;
-
-	if (lcore == spdk_env_get_current_core()) {
-		/*
-		 * The poller is registered on the current core, so call the remove function
-		 * directly.
-		 */
-		_spdk_poller_unregister(spdk_reactor_get(lcore), poller, complete);
-	} else {
-		/*
-		 * The poller is registered on a different core.
-		 * Schedule an event to run on the poller's core that will remove the poller.
-		 */
-		spdk_event_call(spdk_event_allocate(lcore, _spdk_event_remove_poller, poller, complete));
-	}
-}
+SPDK_LOG_REGISTER_COMPONENT("reactor", SPDK_LOG_REACTOR)

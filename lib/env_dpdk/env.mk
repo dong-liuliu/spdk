@@ -39,21 +39,14 @@
 
 DPDK_DIR ?= $(CONFIG_DPDK_DIR)
 
-ifeq ($(DPDK_DIR), )
-ifeq ($(OS),FreeBSD)
-export DPDK_ABS_DIR = /usr/local/share/dpdk/x86_64-native-freebsdapp-clang
-else
-export DPDK_ABS_DIR = /usr/local/share/dpdk/x86_64-native-linuxapp-gcc
-endif
-else
 export DPDK_ABS_DIR = $(abspath $(DPDK_DIR))
-endif
 
 ifneq (, $(wildcard $(DPDK_ABS_DIR)/include/rte_config.h))
-DPDK_INC = -I$(DPDK_ABS_DIR)/include
+DPDK_INC_DIR := $(DPDK_ABS_DIR)/include
 else
-DPDK_INC = -I$(DPDK_ABS_DIR)/include/dpdk
+DPDK_INC_DIR := $(DPDK_ABS_DIR)/include/dpdk
 endif
+DPDK_INC := -I$(DPDK_INC_DIR)
 
 ifneq (, $(wildcard $(DPDK_ABS_DIR)/lib/librte_eal.a))
 DPDK_LIB_EXT = .a
@@ -75,13 +68,30 @@ ifneq ($(wildcard $(DPDK_ABS_DIR)/lib/librte_malloc.*),)
 DPDK_LIB_LIST += rte_malloc
 endif
 
+# librte_pci and librte_bus_pci were added in DPDK 17.11. Link these libraries conditionally
+# based on their existence to maintain backward compatibility.
+ifneq (, $(wildcard $(DPDK_ABS_DIR)/lib/librte_pci.*))
+DPDK_LIB_LIST += rte_pci
+endif
+
+ifneq (, $(wildcard $(DPDK_ABS_DIR)/lib/librte_bus_pci.*))
+DPDK_LIB_LIST += rte_bus_pci
+endif
+
 DPDK_LIB = $(DPDK_LIB_LIST:%=$(DPDK_ABS_DIR)/lib/lib%$(DPDK_LIB_EXT))
 
-ENV_CFLAGS = $(DPDK_INC)
+# SPDK memory registration requires experimental (deprecated) rte_memory API for DPDK 18.05
+ENV_CFLAGS = $(DPDK_INC) -Wno-deprecated-declarations
 ENV_CXXFLAGS = $(ENV_CFLAGS)
 ENV_DPDK_FILE = $(call spdk_lib_list_to_files,env_dpdk)
 ENV_LIBS = $(ENV_DPDK_FILE) $(DPDK_LIB)
 ENV_LINKER_ARGS = $(ENV_DPDK_FILE) -Wl,--start-group -Wl,--whole-archive $(DPDK_LIB) -Wl,--end-group -Wl,--no-whole-archive
+
+ifneq (,$(wildcard $(DPDK_INC_DIR)/rte_config.h))
+ifneq (,$(shell grep -e "define RTE_LIBRTE_VHOST_NUMA 1" -e "define RTE_EAL_NUMA_AWARE_HUGEPAGES 1" $(DPDK_INC_DIR)/rte_config.h))
+ENV_LINKER_ARGS += -lnuma
+endif
+endif
 
 ifeq ($(OS),Linux)
 ENV_LINKER_ARGS += -ldl

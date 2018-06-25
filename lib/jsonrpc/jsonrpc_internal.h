@@ -41,43 +41,69 @@
 #include "spdk_internal/log.h"
 
 #define SPDK_JSONRPC_RECV_BUF_SIZE	(32 * 1024)
-#define SPDK_JSONRPC_SEND_BUF_SIZE	(32 * 1024)
+#define SPDK_JSONRPC_SEND_BUF_SIZE_INIT	(32 * 1024)
+#define SPDK_JSONRPC_SEND_BUF_SIZE_MAX	(32 * 1024 * 1024)
+#define SPDK_JSONRPC_ID_MAX_LEN		128
 #define SPDK_JSONRPC_MAX_CONNS		64
 #define SPDK_JSONRPC_MAX_VALUES		1024
 
 struct spdk_jsonrpc_request {
 	struct spdk_jsonrpc_server_conn *conn;
-	const struct spdk_json_val *id;
+
+	/* Copy of request id value */
+	struct spdk_json_val id;
+	uint8_t id_data[SPDK_JSONRPC_ID_MAX_LEN];
+
+	/* Total space allocated for send_buf */
+	size_t send_buf_size;
+
+	/* Number of bytes used in send_buf (<= send_buf_size) */
+	size_t send_len;
+
+	size_t send_offset;
+
+	uint8_t *send_buf;
+
+	STAILQ_ENTRY(spdk_jsonrpc_request) link;
 };
 
 struct spdk_jsonrpc_server_conn {
 	struct spdk_jsonrpc_server *server;
 	int sockfd;
+	bool closed;
 	struct spdk_json_val values[SPDK_JSONRPC_MAX_VALUES];
 	size_t recv_len;
 	uint8_t recv_buf[SPDK_JSONRPC_RECV_BUF_SIZE];
-	size_t send_len;
-	uint8_t send_buf[SPDK_JSONRPC_SEND_BUF_SIZE];
-	struct spdk_json_write_ctx *json_writer;
-	bool batch;
+	uint32_t outstanding_requests;
+
+	pthread_spinlock_t queue_lock;
+	STAILQ_HEAD(, spdk_jsonrpc_request) send_queue;
+
+	struct spdk_jsonrpc_request *send_request;
+
+	TAILQ_ENTRY(spdk_jsonrpc_server_conn) link;
 };
 
 struct spdk_jsonrpc_server {
 	int sockfd;
 	spdk_jsonrpc_handle_request_fn handle_request;
-	struct spdk_jsonrpc_server_conn conns[SPDK_JSONRPC_MAX_CONNS];
-	struct pollfd pollfds[SPDK_JSONRPC_MAX_CONNS + 1];
-	int num_conns;
+
+	TAILQ_HEAD(, spdk_jsonrpc_server_conn) free_conns;
+	TAILQ_HEAD(, spdk_jsonrpc_server_conn) conns;
+
+	struct spdk_jsonrpc_server_conn conns_array[SPDK_JSONRPC_MAX_CONNS];
 };
 
 /* jsonrpc_server_tcp */
-int spdk_jsonrpc_server_write_cb(void *cb_ctx, const void *data, size_t size);
 void spdk_jsonrpc_server_handle_request(struct spdk_jsonrpc_request *request,
 					const struct spdk_json_val *method,
 					const struct spdk_json_val *params);
 void spdk_jsonrpc_server_handle_error(struct spdk_jsonrpc_request *request, int error);
+void spdk_jsonrpc_server_send_response(struct spdk_jsonrpc_server_conn *conn,
+				       struct spdk_jsonrpc_request *request);
 
 /* jsonrpc_server */
 int spdk_jsonrpc_parse_request(struct spdk_jsonrpc_server_conn *conn, void *json, size_t size);
+void spdk_jsonrpc_free_request(struct spdk_jsonrpc_request *request);
 
 #endif

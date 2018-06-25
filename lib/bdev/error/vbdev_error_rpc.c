@@ -35,7 +35,7 @@
 #include "spdk/string.h"
 #include "spdk/rpc.h"
 #include "spdk/util.h"
-
+#include "spdk/string.h"
 #include "spdk_internal/log.h"
 #include "vbdev_error.h"
 
@@ -92,7 +92,6 @@ spdk_rpc_construct_error_bdev(struct spdk_jsonrpc_request *request,
 {
 	struct rpc_construct_error_bdev req = {};
 	struct spdk_json_write_ctx *w;
-	struct spdk_bdev *base_bdev;
 
 	if (spdk_json_decode_object(params, rpc_construct_error_bdev_decoders,
 				    SPDK_COUNTOF(rpc_construct_error_bdev_decoders),
@@ -101,13 +100,7 @@ spdk_rpc_construct_error_bdev(struct spdk_jsonrpc_request *request,
 		goto invalid;
 	}
 
-	base_bdev = spdk_bdev_get_by_name(req.base_name);
-	if (!base_bdev) {
-		SPDK_ERRLOG("Could not find ErrorInjection bdev %s\n", req.base_name);
-		goto invalid;
-	}
-
-	if (spdk_vbdev_error_create(base_bdev)) {
+	if (spdk_vbdev_error_create(req.base_name)) {
 		SPDK_ERRLOG("Could not create ErrorInjection bdev %s\n", req.base_name);
 		goto invalid;
 	}
@@ -129,7 +122,69 @@ invalid:
 	spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_INVALID_PARAMS, "Invalid parameters");
 	free_rpc_construct_error_bdev(&req);
 }
-SPDK_RPC_REGISTER("construct_error_bdev", spdk_rpc_construct_error_bdev)
+SPDK_RPC_REGISTER("construct_error_bdev", spdk_rpc_construct_error_bdev, SPDK_RPC_RUNTIME)
+
+struct rpc_delete_error {
+	char *name;
+};
+
+static void
+free_rpc_delete_error(struct rpc_delete_error *r)
+{
+	free(r->name);
+}
+
+static const struct spdk_json_object_decoder rpc_delete_error_decoders[] = {
+	{"name", offsetof(struct rpc_delete_error, name), spdk_json_decode_string},
+};
+
+static void
+_spdk_rpc_delete_error_bdev_cb(void *cb_arg, int bdeverrno)
+{
+	struct spdk_jsonrpc_request *request = cb_arg;
+	struct spdk_json_write_ctx *w;
+
+	w = spdk_jsonrpc_begin_result(request);
+	if (w == NULL) {
+		return;
+	}
+
+	spdk_json_write_bool(w, bdeverrno == 0);
+	spdk_jsonrpc_end_result(request, w);
+}
+
+static void
+spdk_rpc_delete_error_bdev(struct spdk_jsonrpc_request *request,
+			   const struct spdk_json_val *params)
+{
+	struct rpc_delete_error req = {NULL};
+	struct spdk_bdev *vbdev;
+	int rc;
+
+	if (spdk_json_decode_object(params, rpc_delete_error_decoders,
+				    SPDK_COUNTOF(rpc_delete_error_decoders),
+				    &req)) {
+		rc = -EINVAL;
+		goto invalid;
+	}
+
+	vbdev = spdk_bdev_get_by_name(req.name);
+	if (vbdev == NULL) {
+		rc = -ENODEV;
+		goto invalid;
+	}
+
+	spdk_vbdev_error_delete(vbdev, _spdk_rpc_delete_error_bdev_cb, request);
+
+	free_rpc_delete_error(&req);
+
+	return;
+
+invalid:
+	free_rpc_delete_error(&req);
+	spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_INVALID_PARAMS, spdk_strerror(-rc));
+}
+SPDK_RPC_REGISTER("delete_error_bdev", spdk_rpc_delete_error_bdev, SPDK_RPC_RUNTIME)
 
 struct rpc_error_information {
 	char *name;
@@ -200,4 +255,4 @@ invalid:
 	spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_INVALID_PARAMS, "Invalid parameters");
 	free_rpc_error_information(&req);
 }
-SPDK_RPC_REGISTER("bdev_inject_error", spdk_rpc_bdev_inject_error)
+SPDK_RPC_REGISTER("bdev_inject_error", spdk_rpc_bdev_inject_error, SPDK_RPC_RUNTIME)

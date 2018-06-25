@@ -37,6 +37,9 @@
 #include "spdk/env.h"
 #include "spdk/util.h"
 
+static void
+spdk_scsi_task_free_data(struct spdk_scsi_task *task);
+
 void
 spdk_scsi_task_put(struct spdk_scsi_task *task)
 {
@@ -47,12 +50,7 @@ spdk_scsi_task_put(struct spdk_scsi_task *task)
 	task->ref--;
 
 	if (task->ref == 0) {
-		struct spdk_bdev_io *bdev_io = task->blockdev_io;
-
-		if (task->parent) {
-			spdk_scsi_task_put(task->parent);
-			task->parent = NULL;
-		}
+		struct spdk_bdev_io *bdev_io = task->bdev_io;
 
 		if (bdev_io) {
 			spdk_bdev_free_io(bdev_io);
@@ -67,8 +65,7 @@ spdk_scsi_task_put(struct spdk_scsi_task *task)
 void
 spdk_scsi_task_construct(struct spdk_scsi_task *task,
 			 spdk_scsi_task_cpl cpl_fn,
-			 spdk_scsi_task_free free_fn,
-			 struct spdk_scsi_task *parent)
+			 spdk_scsi_task_free free_fn)
 {
 	assert(task != NULL);
 	assert(cpl_fn != NULL);
@@ -85,20 +82,9 @@ spdk_scsi_task_construct(struct spdk_scsi_task *task,
 	assert(task->iov.iov_base == NULL);
 	task->iovs = &task->iov;
 	task->iovcnt = 1;
-
-	if (parent != NULL) {
-		parent->ref++;
-		task->parent = parent;
-		task->dxfer_dir = parent->dxfer_dir;
-		task->transfer_len = parent->transfer_len;
-		task->lun = parent->lun;
-		task->cdb = parent->cdb;
-		task->target_port = parent->target_port;
-		task->initiator_port = parent->initiator_port;
-	}
 }
 
-void
+static void
 spdk_scsi_task_free_data(struct spdk_scsi_task *task)
 {
 	if (task->alloc_len != 0) {
@@ -110,7 +96,7 @@ spdk_scsi_task_free_data(struct spdk_scsi_task *task)
 	task->iov.iov_len = 0;
 }
 
-void *
+static void *
 spdk_scsi_task_alloc_data(struct spdk_scsi_task *task, uint32_t alloc_len)
 {
 	assert(task->alloc_len == 0);
@@ -131,8 +117,9 @@ spdk_scsi_task_scatter_data(struct spdk_scsi_task *task, const void *src, size_t
 	struct iovec *iovs = task->iovs;
 	const uint8_t *pos;
 
-	if (buf_len == 0)
+	if (buf_len == 0) {
 		return 0;
+	}
 
 	if (task->iovcnt == 1 && iovs[0].iov_base == NULL) {
 		spdk_scsi_task_alloc_data(task, buf_len);
@@ -257,4 +244,13 @@ spdk_scsi_task_set_status(struct spdk_scsi_task *task, int sc, int sk,
 		spdk_scsi_task_build_sense_data(task, sk, asc, ascq);
 	}
 	task->status = sc;
+}
+
+void
+spdk_scsi_task_copy_status(struct spdk_scsi_task *dst,
+			   struct spdk_scsi_task *src)
+{
+	memcpy(dst->sense_data, src->sense_data, src->sense_data_len);
+	dst->sense_data_len = src->sense_data_len;
+	dst->status = src->status;
 }

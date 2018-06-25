@@ -31,55 +31,18 @@
  *   OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 
-#include "spdk_internal/event.h"
-#include "spdk_internal/bdev.h"
-#include "spdk_internal/log.h"
-
 #include "gpt.h"
 
-#include "spdk/event.h"
+#include "spdk/crc32.h"
 #include "spdk/endian.h"
-#include "spdk/env.h"
-#include "spdk/io_channel.h"
+#include "spdk/event.h"
+
+#include "spdk_internal/log.h"
 
 #define GPT_PRIMARY_PARTITION_TABLE_LBA 0x1
 #define PRIMARY_PARTITION_NUMBER 4
 #define GPT_PROTECTIVE_MBR 1
 #define SPDK_MAX_NUM_PARTITION_ENTRIES 128
-#define SPDK_GPT_CRC32C_POLYNOMIAL_REFLECT 0xedb88320UL
-
-static uint32_t spdk_gpt_crc32_table[256];
-
-__attribute__((constructor)) static void
-spdk_gpt_init_crc32(void)
-{
-	int i, j;
-	uint32_t val;
-
-	for (i = 0; i < 256; i++) {
-		val = i;
-		for (j = 0; j < 8; j++) {
-			if (val & 1) {
-				val = (val >> 1) ^ SPDK_GPT_CRC32C_POLYNOMIAL_REFLECT;
-			} else {
-				val = (val >> 1);
-			}
-		}
-		spdk_gpt_crc32_table[i] = val;
-	}
-}
-
-static uint32_t
-spdk_gpt_crc32(const uint8_t *buf, uint32_t size, uint32_t seed)
-{
-	uint32_t i, crc32 = seed;
-
-	for (i = 0; i < size; i++) {
-		crc32 = spdk_gpt_crc32_table[(crc32 ^ buf[i]) & 0xff] ^ (crc32 >> 8);
-	}
-
-	return crc32 ^ seed;
-}
 
 static int
 spdk_gpt_read_partitions(struct spdk_gpt *gpt)
@@ -113,7 +76,8 @@ spdk_gpt_read_partitions(struct spdk_gpt *gpt)
 	gpt->partitions = (struct spdk_gpt_partition_entry *)(gpt->buf +
 			  partition_start_lba * gpt->sector_size);
 
-	crc32 = spdk_gpt_crc32((uint8_t *)gpt->partitions, total_partition_size, ~0);
+	crc32 = spdk_crc32_ieee_update(gpt->partitions, total_partition_size, ~0);
+	crc32 ^= ~0;
 
 	if (crc32 != from_le32(&head->partition_entry_array_crc32)) {
 		SPDK_ERRLOG("GPT partition entry array crc32 did not match\n");
@@ -168,7 +132,8 @@ spdk_gpt_read_header(struct spdk_gpt *gpt)
 
 	original_crc = from_le32(&head->header_crc32);
 	head->header_crc32 = 0;
-	new_crc = spdk_gpt_crc32((uint8_t *)head, from_le32(&head->header_size), ~0);
+	new_crc = spdk_crc32_ieee_update(head, from_le32(&head->header_size), ~0);
+	new_crc ^= ~0;
 	/* restore header crc32 */
 	to_le32(&head->header_crc32, original_crc);
 
@@ -202,16 +167,9 @@ spdk_gpt_check_mbr(struct spdk_gpt *gpt)
 
 	mbr = (struct spdk_mbr *)gpt->buf;
 	if (from_le16(&mbr->mbr_signature) != SPDK_MBR_SIGNATURE) {
-		SPDK_TRACELOG(SPDK_TRACE_GPT_PARSE, "Signature mismatch, provided=%x,"
+		SPDK_DEBUGLOG(SPDK_LOG_GPT_PARSE, "Signature mismatch, provided=%x,"
 			      "expected=%x\n", from_le16(&mbr->disk_signature),
 			      SPDK_MBR_SIGNATURE);
-		return -1;
-	}
-
-	to_le32(&expected_start_lba, GPT_PRIMARY_PARTITION_TABLE_LBA);
-	if (mbr->partitions[0].start_lba != expected_start_lba) {
-		SPDK_TRACELOG(SPDK_TRACE_GPT_PARSE, "start lba mismatch, provided=%u, expected=%u\n",
-			      mbr->partitions[0].start_lba, expected_start_lba);
 		return -1;
 	}
 
@@ -224,6 +182,14 @@ spdk_gpt_check_mbr(struct spdk_gpt *gpt)
 	}
 
 	if (ret == GPT_PROTECTIVE_MBR) {
+		expected_start_lba = GPT_PRIMARY_PARTITION_TABLE_LBA;
+		if (from_le32(&mbr->partitions[primary_partition].start_lba) != expected_start_lba) {
+			SPDK_DEBUGLOG(SPDK_LOG_GPT_PARSE, "start lba mismatch, provided=%u, expected=%u\n",
+				      from_le32(&mbr->partitions[primary_partition].start_lba),
+				      expected_start_lba);
+			return -1;
+		}
+
 		total_lba_size = from_le32(&mbr->partitions[primary_partition].size_lba);
 		if ((total_lba_size != ((uint32_t) gpt->total_sectors - 1)) &&
 		    (total_lba_size != 0xFFFFFFFF)) {
@@ -232,11 +198,10 @@ spdk_gpt_check_mbr(struct spdk_gpt *gpt)
 			return -1;
 		}
 	} else {
-		SPDK_ERRLOG("Currently only support GPT Protective MBR format\n");
+		SPDK_DEBUGLOG(SPDK_LOG_GPT_PARSE, "Currently only support GPT Protective MBR format\n");
 		return -1;
 	}
 
-	gpt->mbr = mbr;
 	return 0;
 }
 
@@ -252,7 +217,7 @@ spdk_gpt_parse(struct spdk_gpt *gpt)
 
 	rc = spdk_gpt_check_mbr(gpt);
 	if (rc) {
-		SPDK_TRACELOG(SPDK_TRACE_GPT_PARSE, "Failed to detect gpt in MBR\n");
+		SPDK_DEBUGLOG(SPDK_LOG_GPT_PARSE, "Failed to detect gpt in MBR\n");
 		return rc;
 	}
 
@@ -271,4 +236,4 @@ spdk_gpt_parse(struct spdk_gpt *gpt)
 	return 0;
 }
 
-SPDK_LOG_REGISTER_TRACE_FLAG("gpt_parse", SPDK_TRACE_GPT_PARSE)
+SPDK_LOG_REGISTER_COMPONENT("gpt_parse", SPDK_LOG_GPT_PARSE)
