@@ -39,6 +39,7 @@ CFLAGS += -Irte_vhost
 CFLAGS += $(ENV_CFLAGS)
 
 C_SRCS = vhost.c vhost_rpc.c vhost_scsi.c vhost_blk.c vhost_nvme.c
+C_SRCS += vhost_fs.c vhost_fs_ops.c
 
 LIBNAME = vhost
 
