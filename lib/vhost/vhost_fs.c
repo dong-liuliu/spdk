@@ -280,8 +280,8 @@ process_vq(struct spdk_vhost_fs_session *fvsession, struct spdk_vhost_virtqueue 
 		vsession->task_cnt++;
 
 		task->used = true;
-		task->in_iovcnt = SPDK_COUNTOF(task->in_iovs);
-		task->out_iovcnt = SPDK_COUNTOF(task->out_iovs);
+		task->in_iovcnt = 0;
+		task->out_iovcnt = 0;
 		task->status = NULL;
 		task->used_len = 0;
 
@@ -394,15 +394,6 @@ to_fs_dev(struct spdk_vhost_dev *vdev)
 
 	return SPDK_CONTAINEROF(vdev, struct spdk_vhost_fs_dev, vdev);
 }
-
-//struct spdk_bdev *
-//spdk_vhost_blk_get_dev(struct spdk_vhost_dev *vdev)
-//{
-//	struct spdk_vhost_blk_dev *bvdev = to_blk_dev(vdev);
-//
-//	assert(bvdev != NULL);
-//	return bvdev->bdev;
-//}
 
 static int
 _spdk_vhost_session_bdev_remove_cb(struct spdk_vhost_dev *vdev, struct spdk_vhost_session *vsession,
@@ -588,12 +579,11 @@ spdk_vhost_fs_start(struct spdk_vhost_session *vsession)
 	return rc;
 }
 
-#if 0
 static int
 destroy_session_poller_cb(void *arg)
 {
-	struct spdk_vhost_blk_session *bvsession = arg;
-	struct spdk_vhost_session *vsession = &bvsession->vsession;
+	struct spdk_vhost_fs_session *fvsession = arg;
+	struct spdk_vhost_session *vsession = &fvsession->vsession;
 	int i;
 
 	if (vsession->task_cnt > 0) {
@@ -607,34 +597,34 @@ destroy_session_poller_cb(void *arg)
 
 	SPDK_INFOLOG(SPDK_LOG_VHOST, "Stopping poller for vhost controller %s\n", vsession->vdev->name);
 
-	if (bvsession->io_channel) {
-		spdk_put_io_channel(bvsession->io_channel);
-		bvsession->io_channel = NULL;
+	if (fvsession->io_channel) {
+		spdk_put_io_channel(fvsession->io_channel);
+		fvsession->io_channel = NULL;
 	}
 
-	free_task_pool(bvsession);
-	spdk_poller_unregister(&bvsession->destroy_ctx.poller);
-	spdk_vhost_session_event_done(bvsession->destroy_ctx.event_ctx, 0);
+	free_task_pool(fvsession);
+	spdk_poller_unregister(&fvsession->destroy_ctx.poller);
+	spdk_vhost_session_event_done(fvsession->destroy_ctx.event_ctx, 0);
 
 	return -1;
 }
 
 static int
-spdk_vhost_blk_stop_cb(struct spdk_vhost_dev *vdev,
+spdk_vhost_fs_stop_cb(struct spdk_vhost_dev *vdev,
 		       struct spdk_vhost_session *vsession, void *event_ctx)
 {
-	struct spdk_vhost_blk_session *bvsession;
+	struct spdk_vhost_fs_session *fvsession;
 
-	bvsession = to_blk_session(vsession);
-	if (bvsession == NULL) {
-		SPDK_ERRLOG("Trying to stop non-blk controller as a blk one.\n");
+	fvsession = to_fs_session(vsession);
+	if (fvsession == NULL) {
+		SPDK_ERRLOG("Trying to stop non-fs controller as a fs one.\n");
 		goto err;
 	}
 
-	bvsession->destroy_ctx.event_ctx = event_ctx;
-	spdk_poller_unregister(&bvsession->requestq_poller);
-	bvsession->destroy_ctx.poller = spdk_poller_register(destroy_session_poller_cb,
-					bvsession, 1000);
+	fvsession->destroy_ctx.event_ctx = event_ctx;
+	spdk_poller_unregister(&fvsession->requestq_poller);
+	fvsession->destroy_ctx.poller = spdk_poller_register(destroy_session_poller_cb,
+					fvsession, 1000);
 	return 0;
 
 err:
@@ -647,7 +637,8 @@ spdk_vhost_fs_stop(struct spdk_vhost_session *vsession)
 {
 	int rc;
 
-	rc = spdk_vhost_session_send_event(vsession, spdk_vhost_blk_stop_cb,
+	SPDK_NOTICELOG("Start to stop vhost fs session\n");
+	rc = spdk_vhost_session_send_event(vsession, spdk_vhost_fs_stop_cb,
 					   3, "stop session");
 	if (rc != 0) {
 		return rc;
@@ -658,21 +649,30 @@ spdk_vhost_fs_stop(struct spdk_vhost_session *vsession)
 	return 0;
 }
 
+static struct spdk_bdev *
+spdk_vhost_fs_get_bdev(struct spdk_vhost_dev *vdev)
+{
+	struct spdk_vhost_fs_dev *fvdev = to_fs_dev(vdev);
+
+	assert(fvdev != NULL);
+	return fvdev->bdev;
+}
+
 static void
 spdk_vhost_fs_dump_info_json(struct spdk_vhost_dev *vdev, struct spdk_json_write_ctx *w)
 {
-	struct spdk_bdev *bdev = spdk_vhost_blk_get_dev(vdev);
-	struct spdk_vhost_blk_dev *bvdev;
+	struct spdk_bdev *bdev = spdk_vhost_fs_get_bdev(vdev);
+	struct spdk_vhost_fs_dev *fvdev;
 
-	bvdev = to_blk_dev(vdev);
-	if (bvdev == NULL) {
+	fvdev = to_fs_dev(vdev);
+	if (fvdev == NULL) {
 		return;
 	}
 
-	assert(bvdev != NULL);
-	spdk_json_write_named_object_begin(w, "block");
+	assert(fvdev != NULL);
+	spdk_json_write_named_object_begin(w, "fuse");
 
-	spdk_json_write_named_bool(w, "readonly", bvdev->readonly);
+//	spdk_json_write_named_bool(w, "readonly", fvdev->readonly);
 
 	spdk_json_write_name(w, "bdev");
 	if (bdev) {
@@ -684,6 +684,7 @@ spdk_vhost_fs_dump_info_json(struct spdk_vhost_dev *vdev, struct spdk_json_write
 	spdk_json_write_object_end(w);
 }
 
+#if 0
 static void
 spdk_vhost_fs_write_config_json(struct spdk_vhost_dev *vdev, struct spdk_json_write_ctx *w)
 {
@@ -783,7 +784,8 @@ static int spdk_vhost_fs_destroy(struct spdk_vhost_dev *vdev);
 static const struct spdk_vhost_dev_backend vhost_fs_device_backend = {
 	// TODO: clarify virtio features for blobfs
 	.virtio_features = SPDK_VHOST_FEATURES,
-	.disabled_features = SPDK_VHOST_DISABLED_FEATURES,
+	.disabled_features = 0,
+//	.disabled_features = SPDK_VHOST_DISABLED_FEATURES,
 //	.virtio_features = SPDK_VHOST_FEATURES |
 //	(1ULL << VIRTIO_BLK_F_SIZE_MAX) | (1ULL << VIRTIO_BLK_F_SEG_MAX) |
 //	(1ULL << VIRTIO_BLK_F_GEOMETRY) | (1ULL << VIRTIO_BLK_F_RO) |
@@ -799,9 +801,9 @@ static const struct spdk_vhost_dev_backend vhost_fs_device_backend = {
 
 	.session_ctx_size = sizeof(struct spdk_vhost_fs_session) - sizeof(struct spdk_vhost_session),
 	.start_session =  spdk_vhost_fs_start,
-//	.stop_session = spdk_vhost_fs_stop,
+	.stop_session = spdk_vhost_fs_stop,
 //	.vhost_get_config = spdk_vhost_fs_get_config,
-//	.dump_info_json = spdk_vhost_fs_dump_info_json,
+	.dump_info_json = spdk_vhost_fs_dump_info_json,
 //	.write_config_json = spdk_vhost_fs_write_config_json,
 	.remove_device = spdk_vhost_fs_destroy,
 };
