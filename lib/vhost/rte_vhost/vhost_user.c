@@ -175,6 +175,8 @@ vhost_user_reset_owner(struct virtio_net *dev)
 static uint64_t
 vhost_user_get_features(struct virtio_net *dev)
 {
+
+	fprintf(stdout, "Get feature: vhost_feature is 0x%lx\n", dev->features);
 	return dev->features;
 }
 
@@ -187,6 +189,7 @@ vhost_user_set_features(struct virtio_net *dev, uint64_t features)
 	uint64_t vhost_features = 0;
 
 	vhost_features = vhost_user_get_features(dev);
+	fprintf(stdout, "vhost_feature is 0x%lx, set feature is 0x%lx\n", vhost_features, features);
 	if (features & ~vhost_features) {
 		RTE_LOG(ERR, VHOST_CONFIG,
 			"(%d) received invalid negotiated features.\n",

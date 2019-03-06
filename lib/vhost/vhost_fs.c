@@ -233,10 +233,11 @@ process_fs_request(struct spdk_vhost_fs_task *task,
 	task->unique = fuse_in->unique;
 //	task-> = fuse_in->pid;
 
+	SPDK_DEBUGLOG(SPDK_LOG_VHOST_FS, "Send request type '%"PRIu32"'.\n", fuse_in->opcode);
 	rc = spdk_fuse_ll_ops[fuse_in->opcode].func(task, fuse_in->nodeid, task->out_iovs[1].iov_base);
 	if (rc != 0) {
 		SPDK_DEBUGLOG(SPDK_LOG_VHOST_FS, "Not supported request type '%"PRIu32"'.\n", fuse_in->opcode);
-		invalid_fs_request(task, VIRTIO_BLK_S_UNSUPP);
+//		invalid_fs_request(task, VIRTIO_BLK_S_UNSUPP);
 		return -1;
 	}
 
@@ -289,15 +290,15 @@ process_vq(struct spdk_vhost_fs_session *fvsession, struct spdk_vhost_virtqueue 
 
 		if (likely(rc == 0)) {
 //					task_submit(task);
-					SPDK_DEBUGLOG(SPDK_LOG_VHOST_SCSI, "====== Task %p req_idx %d submitted ======\n", task,
+					SPDK_DEBUGLOG(SPDK_LOG_VHOST_FS, "====== Task %p req_idx %d submitted ======\n", task,
 						      task->req_idx);
 				} else if (rc > 0) {
 //					spdk_vhost_scsi_task_cpl(&task->scsi);
-					SPDK_DEBUGLOG(SPDK_LOG_VHOST_SCSI, "====== Task %p req_idx %d finished early ======\n", task,
+					SPDK_DEBUGLOG(SPDK_LOG_VHOST_FS, "====== Task %p req_idx %d finished early ======\n", task,
 						      task->req_idx);
 				} else {
 //					invalid_request(task);
-					SPDK_DEBUGLOG(SPDK_LOG_VHOST_SCSI, "====== Task %p req_idx %d failed ======\n", task,
+					SPDK_DEBUGLOG(SPDK_LOG_VHOST_FS, "====== Task %p req_idx %d failed ======\n", task,
 						      task->req_idx);
 				}
 	}
