@@ -196,8 +196,8 @@ process_fs_request(struct spdk_vhost_fs_task *task,
 		SPDK_DEBUGLOG(SPDK_LOG_VHOST_FS,
 			      "First descriptor size is %zu but expected %zu (req_idx = %"PRIu16").\n",
 			      iov->iov_len, sizeof(*fuse_in), task->req_idx);
-		assert(false);
-		invalid_fs_request(task, VIRTIO_BLK_S_UNSUPP);
+//		assert(false);
+//		invalid_fs_request(task, VIRTIO_BLK_S_UNSUPP);
 		return -1;
 	}
 
@@ -209,8 +209,8 @@ process_fs_request(struct spdk_vhost_fs_task *task,
 			SPDK_DEBUGLOG(SPDK_LOG_VHOST_FS,
 				      "Last descriptor size is %zu but expected %d (req_idx = %"PRIu16").\n",
 				      iov->iov_len, 1, task->req_idx);
-			invalid_fs_request(task, VIRTIO_BLK_S_UNSUPP);
-			return -1;
+//			invalid_fs_request(task, VIRTIO_BLK_S_UNSUPP);
+//			return -1;
 		}
 	}
 
@@ -234,7 +234,12 @@ process_fs_request(struct spdk_vhost_fs_task *task,
 //	task-> = fuse_in->pid;
 
 	SPDK_DEBUGLOG(SPDK_LOG_VHOST_FS, "Send request type '%"PRIu32"'.\n", fuse_in->opcode);
-	rc = spdk_fuse_ll_ops[fuse_in->opcode].func(task, fuse_in->nodeid, task->out_iovs[1].iov_base);
+
+	char *argin = task->out_iovs[1].iov_base;
+	if (task->out_iovs[1].iov_len > sizeof(struct fuse_in_header)) {
+		argin = task->out_iovs[0].iov_base + sizeof(struct fuse_in_header);
+	}
+	rc = spdk_fuse_ll_ops[fuse_in->opcode].func(task, fuse_in->nodeid, argin);
 	if (rc != 0) {
 		SPDK_DEBUGLOG(SPDK_LOG_VHOST_FS, "Not supported request type '%"PRIu32"'.\n", fuse_in->opcode);
 //		invalid_fs_request(task, VIRTIO_BLK_S_UNSUPP);

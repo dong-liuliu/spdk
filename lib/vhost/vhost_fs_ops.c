@@ -210,7 +210,7 @@ do_getattr(struct spdk_vhost_fs_task *task, uint64_t node_id, const void *in_arg
 	const char *file_path;
 
 	if (1) {
-		fprintf(stderr, "do_getattr:\n");
+		fprintf(stderr, "do_getattr: nodeid is %ld\n", node_id);
 			fprintf(stderr, "getattr_flags=0x%x\n", arg->getattr_flags);
 			fprintf(stderr, "fh=0x%lx\n", arg->fh);
 			fprintf(stderr, "dummy=0x%x\n", arg->dummy);
@@ -228,9 +228,9 @@ do_getattr(struct spdk_vhost_fs_task *task, uint64_t node_id, const void *in_arg
 	} else {
 		SPDK_ERRLOG("node is not root dir, not support yet\n");
 
-		file = (struct spdk_file *)arg->fh;
+		file = (struct spdk_file *)node_id;
 		file_path = spdk_file_get_name(file);
-		file_path = "/";
+//		file_path = "/";
 	}
 
 	if (!strcmp(file_path, "/")) {
@@ -546,13 +546,14 @@ _do_lookup_open(void *ctx, struct spdk_file *f, int fserrno)
 //	assert(false);
 	assert(task->in_iovs[1].iov_len >= size);
 
-#if 0
+#if 1
 	memset(earg, 0, size);
 	earg->nodeid = f;
-	earg->attr_valid = 1;
-	earg->entry_valid = 1;
+	earg->attr_valid = 0;
+	earg->entry_valid = 0;
 	earg->attr.mode = S_IFREG | 0644;
 	earg->attr.nlink = 1;
+	earg->attr.ino = f;
 #else
 	uint8_t testbuf[144] = {0x0, 0x94, 0x0, 0x48, 0xaa, 0x7f, 0x0, 0x0, //nodeid
 			 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0,//generation
@@ -705,11 +706,6 @@ do_readdir(struct spdk_vhost_fs_task *task, uint64_t node_id, const void *in_arg
 				node_id, arg->fh, arg->offset, arg->size,
 				arg->read_flags, arg->lock_owner, arg->flags);
 	}
-
-	static int i = 0;
-
-	i++;
-	assert(i < 4);
 
 	/* Only support root dir */
 	if (node_id != 1) {
