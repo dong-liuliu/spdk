@@ -57,31 +57,34 @@
 #include "vhost_internal.h"
 
 struct spdk_vhost_fs_task {
-	struct spdk_bdev_io *bdev_io;
 	struct spdk_vhost_fs_session *fvsession;
 	struct spdk_vhost_virtqueue *vq;
-
-	volatile uint8_t *status;
-
 	uint16_t req_idx;
 
-	/* In is used by fuse_out_header and its followings;
-	 * Out is used by fuse in header and its followings
+	/* If set, the task is currently used for I/O processing. */
+	bool used;
+
+	/* In_XXX is used by fuse_out_header and its followings;
+	 * Out_XXX is used by fuse in header and its followings.
+	 * Generally, each out_iovs[0] only contains fuse_in_header, which is 40B;
+	 * And each in_iovs[0] only contains fuse_out_header, which is 16B.
+	 * For FORGET cmd, out_iovs[0] may be 64B, also contains fuse_forget_in or others,
+	 * and FORGET has no in_iovs.
 	 */
 	uint16_t in_iovcnt;
 	uint16_t out_iovcnt;
 	struct iovec in_iovs[SPDK_VHOST_IOVS_MAX];
 	struct iovec out_iovs[SPDK_VHOST_IOVS_MAX];
 
-	/* If set, the task is currently used for I/O processing. */
-	bool used;
-
 	/** Number of bytes that were written. */
 	uint32_t used_len;
 
-	/* fuse related */
+	/* CMD index -- fuse related */
 	uint64_t unique;
-//	struct fuse_ctx ctx;
+	/* internal ctx for blobfs operation */
+	union {
+		struct spdk_file *fp; // used by lookup
+	}u;
 };
 
 struct spdk_vhost_fs_dev {
@@ -91,6 +94,7 @@ struct spdk_vhost_fs_dev {
 	struct spdk_bdev *bdev;
 	struct spdk_bs_dev *bs_dev;
 
+	/* Records, used by contruct callback */
 	const char *name;
 	spdk_vhost_fs_construct_cb cb_fn;
 	void *cb_arg;
@@ -101,27 +105,23 @@ struct spdk_vhost_fs_session {
 	struct spdk_vhost_session vsession;
 	struct spdk_vhost_fs_dev *fvdev;
 	struct spdk_poller *requestq_poller;
-	struct spdk_io_channel *io_channel;
 	struct spdk_vhost_dev_destroy_ctx destroy_ctx;
 
+	// TODO: verify its usage
+	struct spdk_io_channel *io_channel;
+
+	// TODO: fuse_common.h struct
 	struct fuse_conn_info cinfo;
 };
 
 struct spdk_fuse_op {
 	/* Return 0, successfully submitted; or -errno if failed. */
 	int (*func)(struct spdk_vhost_fs_task *task, uint64_t node_id, const void *in_arg);
-	const char *name;
+	const char *op_name;
 };
 
-
-static inline void
-fs_task_finish(struct spdk_vhost_fs_task *task)
-{
-	assert(task->fvsession->vsession.task_cnt > 0);
-	task->fvsession->vsession.task_cnt--;
-	task->used = false;
-}
-
 extern struct spdk_fuse_op *spdk_fuse_ll_ops;
+
+void fs_request_finish(struct spdk_vhost_fs_task *task, int err);
 
 #endif /* SPDK_VHOST_FS_INTERNAL_H */

@@ -48,43 +48,69 @@
 /* forward declaration */
 static const struct spdk_vhost_dev_backend vhost_fs_device_backend;
 
-static int
-process_fs_request(struct spdk_vhost_fs_task *task,
-		    struct spdk_vhost_fs_session *fvsession,
-		    struct spdk_vhost_virtqueue *vq);
-
-
-static void
-invalid_fs_request(struct spdk_vhost_fs_task *task, uint8_t status)
+static inline struct spdk_vhost_fs_task *
+fs_task_get(struct spdk_vhost_virtqueue *vq, uint16_t req_id)
 {
-	if (task->status) {
-		*task->status = status;
+	struct spdk_vhost_fs_task *task;
+	struct spdk_vhost_fs_dev *fvdev;
+	struct spdk_vhost_session *vsession;
+
+	/* Get addr of vsession by one task in virtqueue */
+	vsession = &((struct spdk_vhost_fs_task *)vq->tasks)[0].fvsession->vsession;
+	fvdev = ((struct spdk_vhost_fs_task *)vq->tasks)[0].fvsession->fvdev;
+
+	if (spdk_unlikely(req_id >= vq->vring.size)) {
+		SPDK_ERRLOG("%s: request idx '%"PRIu16"' exceeds virtqueue size (%"PRIu16").\n",
+			    fvdev->vdev.name, req_id, vq->vring.size);
+		spdk_vhost_vq_used_ring_enqueue(vsession, vq, req_id, 0);
+
+		return NULL;
 	}
 
-	spdk_vhost_vq_used_ring_enqueue(&task->fvsession->vsession, task->vq, task->req_idx,
-					task->used_len);
-	fs_task_finish(task);
-	SPDK_DEBUGLOG(SPDK_LOG_VHOST_FS_DATA, "Invalid request (status=%" PRIu8")\n", status);
+	task = &((struct spdk_vhost_fs_task *)vq->tasks)[req_id];
+	if (spdk_unlikely(task->used)) {
+		SPDK_ERRLOG("%s: request with idx '%"PRIu16"' is already pending.\n",
+			    fvdev->vdev.name, req_id);
+		spdk_vhost_vq_used_ring_enqueue(vsession, vq, req_id, 0);
+
+		return NULL;
+	}
+
+	vsession->task_cnt++;
+
+	task->used = true;
+	task->in_iovcnt = 0;
+	task->out_iovcnt = 0;
+	task->used_len = 0;
+
+	return task;
 }
 
-//static void
-//fs_request_finish(bool success, struct spdk_vhost_fs_task *task)
-//{
-//	*task->status = success ? VIRTIO_BLK_S_OK : VIRTIO_BLK_S_IOERR;
-//	spdk_vhost_vq_used_ring_enqueue(&task->fvsession->vsession, task->vq, task->req_idx,
-//					task->used_len);
-//	SPDK_DEBUGLOG(SPDK_LOG_VHOST_BLK, "Finished task (%p) req_idx=%d\n status: %s\n", task,
-//		      task->req_idx, success ? "OK" : "FAIL");
-//	fs_task_finish(task);
-//}
+static inline void
+fs_task_put(struct spdk_vhost_fs_task *task)
+{
+	assert(task->fvsession->vsession.task_cnt > 0);
+	task->fvsession->vsession.task_cnt--;
+	task->used = false;
+}
+
+void
+fs_request_finish(struct spdk_vhost_fs_task *task, int err)
+{
+	SPDK_DEBUGLOG(SPDK_LOG_VHOST_FS, "Finished task (%p) req_idx=%d\n status: %s\n", task,
+		      task->req_idx, !err ? "OK" : "FAIL");
+	spdk_vhost_vq_used_ring_enqueue(&task->fvsession->vsession, task->vq, task->req_idx, task->used_len);
+	fs_task_put(task);
+}
 
 /*
  * Process task's descriptor chain and setup data related fields.
  */
 static int
 fs_task_iovs_setup(struct spdk_vhost_fs_task *task, struct spdk_vhost_virtqueue *vq,
-	       uint16_t req_idx, uint32_t *length)
+	       uint32_t *length)
 {
+	uint16_t req_idx = task->req_idx;
 	struct spdk_vhost_fs_session *fvsession = task->fvsession;
 	struct spdk_vhost_session *vsession = &fvsession->vsession;
 	struct spdk_vhost_dev *vdev = vsession->vdev;
@@ -104,16 +130,16 @@ fs_task_iovs_setup(struct spdk_vhost_fs_task *task, struct spdk_vhost_virtqueue 
 		struct iovec *iovs;
 		uint16_t *cnt;
 
-		if (!spdk_vhost_vring_desc_is_wr(desc)) {
-			iovs = task->out_iovs;
-			cnt = &task->out_iovcnt;
-		} else {
+		if (spdk_vhost_vring_desc_is_wr(desc)) {
 			iovs = task->in_iovs;
 			cnt = &task->in_iovcnt;
+		} else {
+			iovs = task->out_iovs;
+			cnt = &task->out_iovcnt;
 		}
 
 		/*
-		 * Maximum cnt reached?
+		 * Check whether reach maximum iov cnt.
 		 * Should not happen if request is well formatted, otherwise this is a BUG.
 		 */
 		if (spdk_unlikely(*cnt == SPDK_COUNTOF(task->in_iovs))) {
@@ -149,8 +175,7 @@ fs_task_iovs_setup(struct spdk_vhost_fs_task *task, struct spdk_vhost_virtqueue 
 	}
 
 	/*
-	 * There must be least two descriptors.
-	 * First contain request so it must be readable.
+	 * From FUSE protocol, at least there is one descriptor for host to read.
 	 */
 	if (spdk_unlikely(task->out_iovcnt == 0)) {
 		return -1;
@@ -160,104 +185,84 @@ fs_task_iovs_setup(struct spdk_vhost_fs_task *task, struct spdk_vhost_virtqueue 
 	return 0;
 }
 
-//static void
-//fs_request_complete_cb(struct spdk_bdev_io *bdev_io, bool success, void *cb_arg)
-//{
-//	struct spdk_vhost_blk_task *task = cb_arg;
-//
-//	spdk_bdev_free_io(bdev_io);
-//	fs_request_finish(success, task);
-//}
-
-
 static int
 process_fs_request(struct spdk_vhost_fs_task *task,
 		    struct spdk_vhost_fs_session *fvsession,
 		    struct spdk_vhost_virtqueue *vq)
 {
-//	struct spdk_vhost_fs_dev *fvdev = fvsession->fvdev;
-//	const struct virtio_blk_outhdr *req;
-	struct fuse_in_header *fuse_in;
 	struct iovec *iov;
-//	uint32_t type;
-	uint32_t payload_len;
-//	uint64_t flush_bytes;
+	struct fuse_in_header *fuse_in;
+	char *fuse_arg_in;
 	int rc;
+	//TODO: consider remove payload_len
+	uint32_t payload_len;
 
-	if (fs_task_iovs_setup(task, vq, task->req_idx, &payload_len)) {
+	if (fs_task_iovs_setup(task, vq, &payload_len)) {
 		SPDK_DEBUGLOG(SPDK_LOG_VHOST_FS, "Invalid request (req_idx = %"PRIu16").\n", task->req_idx);
 
-		invalid_fs_request(task, VIRTIO_BLK_S_UNSUPP);
+		fs_request_finish(task, EINVAL);
 		return -1;
 	}
 
-	iov = &task->out_iovs[0];
-	if (spdk_unlikely(iov->iov_len != sizeof(struct fuse_in_header))) {
-		SPDK_DEBUGLOG(SPDK_LOG_VHOST_FS,
-			      "First descriptor size is %zu but expected %zu (req_idx = %"PRIu16").\n",
-			      iov->iov_len, sizeof(*fuse_in), task->req_idx);
-//		assert(false);
-//		invalid_fs_request(task, VIRTIO_BLK_S_UNSUPP);
-		return -1;
-	}
-
-	fuse_in = iov->iov_base;
-
+	/* Check first writable iov if it has */
 	if (task->in_iovcnt > 0) {
 		iov = &task->in_iovs[0];
 		if (spdk_unlikely(iov->iov_len != sizeof(struct fuse_out_header))) {
 			SPDK_DEBUGLOG(SPDK_LOG_VHOST_FS,
 				      "Last descriptor size is %zu but expected %d (req_idx = %"PRIu16").\n",
 				      iov->iov_len, 1, task->req_idx);
-//			invalid_fs_request(task, VIRTIO_BLK_S_UNSUPP);
-//			return -1;
+
+			fs_request_finish(task, EINVAL);
+			return -1;
 		}
 	}
 
-	task->status = iov->iov_base;
-//	payload_len -= sizeof(*req) + sizeof(*task->status);
-//	task->iovcnt -= 2;
+	/* Check first readable iov */
+	iov = &task->out_iovs[0];
+	if (spdk_unlikely(iov->iov_len < sizeof(struct fuse_in_header))) {
+		SPDK_DEBUGLOG(SPDK_LOG_VHOST_FS,
+			      "First descriptor size is %zu but expected at least %zu (req_idx = %"PRIu16").\n",
+			      iov->iov_len, sizeof(struct fuse_in_header), task->req_idx);
 
-//	switch (fuse_in) {
-//	// TODO: preprocess
-//	case FUSE_NOTIFY_REPLY:
-//		break;
-//	default:
-//
-//	}
-//
-//	if (in->opcode == ) {
-//		// TODO: preprocess
-//	}
+		fs_request_finish(task, EINVAL);
+		return -1;
+	}
+	fuse_in = iov->iov_base;
 
 	task->unique = fuse_in->unique;
-//	task-> = fuse_in->pid;
 
-	SPDK_DEBUGLOG(SPDK_LOG_VHOST_FS, "Send request type '%"PRIu32"'.\n", fuse_in->opcode);
+	SPDK_DEBUGLOG(SPDK_LOG_VHOST_FS, "FUSE request type '%"PRIu32"'(%s).\n", fuse_in->opcode,
+			spdk_fuse_ll_ops[fuse_in->opcode].op_name);
 
-	char *argin = task->out_iovs[1].iov_base;
-	if (task->out_iovs[1].iov_len > sizeof(struct fuse_in_header)) {
-		argin = task->out_iovs[0].iov_base + sizeof(struct fuse_in_header);
+	/* In general, argument for FUSE operation is the second readable iov.
+	 * But for some brief cmds, like Forget, its argument is also in the end of
+	 * first readable iov.
+	 */
+	fuse_arg_in = task->out_iovs[1].iov_base;
+	if (task->out_iovs[0].iov_len > sizeof(struct fuse_in_header)) {
+		fuse_arg_in = task->out_iovs[0].iov_base + sizeof(struct fuse_in_header);
 	}
-	rc = spdk_fuse_ll_ops[fuse_in->opcode].func(task, fuse_in->nodeid, argin);
-	if (rc != 0) {
+
+	rc = spdk_fuse_ll_ops[fuse_in->opcode].func(task, fuse_in->nodeid, fuse_arg_in);
+
+	//TODO: clear returen of fuse ops
+	if (rc < 0) {
 		SPDK_DEBUGLOG(SPDK_LOG_VHOST_FS, "Not supported request type '%"PRIu32"'.\n", fuse_in->opcode);
-//		invalid_fs_request(task, VIRTIO_BLK_S_UNSUPP);
 		return -1;
 	}
 
-	return 0;
+	return rc;
 }
 
 static void
-process_vq(struct spdk_vhost_fs_session *fvsession, struct spdk_vhost_virtqueue *vq)
+process_fs_vq(struct spdk_vhost_fs_session *fvsession, uint16_t q_idx)
 {
-	struct spdk_vhost_fs_dev *fvdev = fvsession->fvdev;
-	struct spdk_vhost_fs_task *task;
 	struct spdk_vhost_session *vsession = &fvsession->vsession;
-	int rc;
+	struct spdk_vhost_virtqueue *vq = &vsession->virtqueue[q_idx];
+	struct spdk_vhost_fs_task *task;
 	uint16_t reqs[32];
 	uint16_t reqs_cnt, i;
+	int rc;
 
 	reqs_cnt = spdk_vhost_vq_avail_ring_get(vq, reqs, SPDK_COUNTOF(reqs));
 	if (!reqs_cnt) {
@@ -268,44 +273,23 @@ process_vq(struct spdk_vhost_fs_session *fvsession, struct spdk_vhost_virtqueue 
 		SPDK_DEBUGLOG(SPDK_LOG_VHOST_FS, "====== Starting processing request idx %"PRIu16"======\n",
 			      reqs[i]);
 
-		if (spdk_unlikely(reqs[i] >= vq->vring.size)) {
-			SPDK_ERRLOG("%s: request idx '%"PRIu16"' exceeds virtqueue size (%"PRIu16").\n",
-				    fvdev->vdev.name, reqs[i], vq->vring.size);
-			spdk_vhost_vq_used_ring_enqueue(vsession, vq, reqs[i], 0);
+		task = fs_task_get(vq, reqs[i]);
+		if (task == NULL) {
 			continue;
 		}
-
-		task = &((struct spdk_vhost_fs_task *)vq->tasks)[reqs[i]];
-		if (spdk_unlikely(task->used)) {
-			SPDK_ERRLOG("%s: request with idx '%"PRIu16"' is already pending.\n",
-				    fvdev->vdev.name, reqs[i]);
-			spdk_vhost_vq_used_ring_enqueue(vsession, vq, reqs[i], 0);
-			continue;
-		}
-
-		vsession->task_cnt++;
-
-		task->used = true;
-		task->in_iovcnt = 0;
-		task->out_iovcnt = 0;
-		task->status = NULL;
-		task->used_len = 0;
 
 		rc = process_fs_request(task, fvsession, vq);
 
 		if (likely(rc == 0)) {
-//					task_submit(task);
-					SPDK_DEBUGLOG(SPDK_LOG_VHOST_FS, "====== Task %p req_idx %d submitted ======\n", task,
-						      task->req_idx);
-				} else if (rc > 0) {
-//					spdk_vhost_scsi_task_cpl(&task->scsi);
-					SPDK_DEBUGLOG(SPDK_LOG_VHOST_FS, "====== Task %p req_idx %d finished early ======\n", task,
-						      task->req_idx);
-				} else {
-//					invalid_request(task);
-					SPDK_DEBUGLOG(SPDK_LOG_VHOST_FS, "====== Task %p req_idx %d failed ======\n", task,
-						      task->req_idx);
-				}
+			SPDK_DEBUGLOG(SPDK_LOG_VHOST_FS, "====== Task %p req_idx %d submitted ======\n", task,
+				      task->req_idx);
+		} else if (rc > 0) {
+			SPDK_DEBUGLOG(SPDK_LOG_VHOST_FS, "====== Task %p req_idx %d finished early ======\n", task,
+				      task->req_idx);
+		} else {
+			SPDK_DEBUGLOG(SPDK_LOG_VHOST_FS, "====== Task %p req_idx %d failed ======\n", task,
+				      task->req_idx);
+		}
 	}
 }
 
@@ -314,61 +298,16 @@ vdev_worker(void *arg)
 {
 	struct spdk_vhost_fs_session *fvsession = arg;
 	struct spdk_vhost_session *vsession = &fvsession->vsession;
-
 	uint16_t q_idx;
 
 	for (q_idx = 0; q_idx < vsession->max_queues; q_idx++) {
-		process_vq(fvsession, &vsession->virtqueue[q_idx]);
+		process_fs_vq(fvsession, q_idx);
 	}
 
 	spdk_vhost_session_used_signal(vsession);
 
 	return -1;
 }
-
-#if 0
-static void
-no_bdev_process_vq(struct spdk_vhost_blk_session *bvsession, struct spdk_vhost_virtqueue *vq)
-{
-	struct spdk_vhost_session *vsession = &bvsession->vsession;
-	struct iovec iovs[SPDK_VHOST_IOVS_MAX];
-	uint32_t length;
-	uint16_t iovcnt, req_idx;
-
-	if (spdk_vhost_vq_avail_ring_get(vq, &req_idx, 1) != 1) {
-		return;
-	}
-
-	iovcnt = SPDK_COUNTOF(iovs);
-	if (blk_iovs_setup(bvsession, vq, req_idx, iovs, &iovcnt, &length) == 0) {
-		*(volatile uint8_t *)iovs[iovcnt - 1].iov_base = VIRTIO_BLK_S_IOERR;
-		SPDK_DEBUGLOG(SPDK_LOG_VHOST_BLK_DATA, "Aborting request %" PRIu16"\n", req_idx);
-	}
-
-	spdk_vhost_vq_used_ring_enqueue(vsession, vq, req_idx, 0);
-}
-
-static int
-no_bdev_vdev_worker(void *arg)
-{
-	struct spdk_vhost_blk_session *bvsession = arg;
-	struct spdk_vhost_session *vsession = &bvsession->vsession;
-	uint16_t q_idx;
-
-	for (q_idx = 0; q_idx < vsession->max_queues; q_idx++) {
-		no_bdev_process_vq(bvsession, &vsession->virtqueue[q_idx]);
-	}
-
-	spdk_vhost_session_used_signal(vsession);
-
-	if (vsession->task_cnt == 0 && bvsession->io_channel) {
-		spdk_put_io_channel(bvsession->io_channel);
-		bvsession->io_channel = NULL;
-	}
-
-	return -1;
-}
-#endif
 
 static struct spdk_vhost_fs_session *
 to_fs_session(struct spdk_vhost_session *vsession)
@@ -568,12 +507,13 @@ static int
 spdk_vhost_fs_start(struct spdk_vhost_session *vsession)
 {
 	int rc;
-//	struct spdk_vhost_fs_session *fvsession;
 
 	vsession->lcore = spdk_vhost_allocate_reactor(vsession->vdev->cpumask);
 	SPDK_DEBUGLOG(SPDK_LOG_VHOST_FS, "controller allocated lcore %d\n", vsession->lcore);
+
 	/* the load process of blobfs only can be applied at the master core */
 	assert(vsession->lcore == 0);
+
 	rc = spdk_vhost_session_send_event(vsession, spdk_vhost_fs_start_cb,
 					   3, "start session");
 
@@ -788,30 +728,17 @@ spdk_vhost_fs_get_config(struct spdk_vhost_dev *vdev, uint8_t *config,
 static int spdk_vhost_fs_destroy(struct spdk_vhost_dev *vdev);
 
 static const struct spdk_vhost_dev_backend vhost_fs_device_backend = {
-	// TODO: clarify virtio features for blobfs
 	.virtio_features = SPDK_VHOST_FEATURES,
-	.disabled_features = 0,
-//	.disabled_features = SPDK_VHOST_DISABLED_FEATURES,
-//	.virtio_features = SPDK_VHOST_FEATURES |
-//	(1ULL << VIRTIO_BLK_F_SIZE_MAX) | (1ULL << VIRTIO_BLK_F_SEG_MAX) |
-//	(1ULL << VIRTIO_BLK_F_GEOMETRY) | (1ULL << VIRTIO_BLK_F_RO) |
-//	(1ULL << VIRTIO_BLK_F_BLK_SIZE) | (1ULL << VIRTIO_BLK_F_TOPOLOGY) |
-//	(1ULL << VIRTIO_BLK_F_BARRIER)  | (1ULL << VIRTIO_BLK_F_SCSI) |
-//	(1ULL << VIRTIO_BLK_F_FLUSH)    | (1ULL << VIRTIO_BLK_F_CONFIG_WCE) |
-//	(1ULL << VIRTIO_BLK_F_MQ)       | (1ULL << VIRTIO_BLK_F_DISCARD) |
-//	(1ULL << VIRTIO_BLK_F_WRITE_ZEROES),
-//	.disabled_features = SPDK_VHOST_DISABLED_FEATURES | (1ULL << VIRTIO_BLK_F_GEOMETRY) |
-//	(1ULL << VIRTIO_BLK_F_RO) | (1ULL << VIRTIO_BLK_F_FLUSH) | (1ULL << VIRTIO_BLK_F_CONFIG_WCE) |
-//	(1ULL << VIRTIO_BLK_F_BARRIER) | (1ULL << VIRTIO_BLK_F_SCSI) | (1ULL << VIRTIO_BLK_F_DISCARD) |
-//	(1ULL << VIRTIO_BLK_F_WRITE_ZEROES),
+	/* VIRTIO_RING_F_EVENT_IDX is requested by Guest */
+	.disabled_features = (1ULL << VIRTIO_F_NOTIFY_ON_EMPTY),
 
 	.session_ctx_size = sizeof(struct spdk_vhost_fs_session) - sizeof(struct spdk_vhost_session),
 	.start_session =  spdk_vhost_fs_start,
 	.stop_session = spdk_vhost_fs_stop,
-//	.vhost_get_config = spdk_vhost_fs_get_config,
 	.dump_info_json = spdk_vhost_fs_dump_info_json,
-//	.write_config_json = spdk_vhost_fs_write_config_json,
 	.remove_device = spdk_vhost_fs_destroy,
+//	.vhost_get_config = spdk_vhost_fs_get_config,
+//	.write_config_json = spdk_vhost_fs_write_config_json,
 };
 
 #if 0
@@ -862,10 +789,9 @@ spdk_vhost_blk_controller_construct(void)
 static void
 fs_init_cb(void *ctx, struct spdk_filesystem *fs, int fserrno)
 {
-//	struct spdk_event *event;
 	struct spdk_vhost_fs_dev *fvdev = ctx;
 	uint64_t features = 0;
-	int ret;
+	int ret = 0;
 	char *cpumask;
 
 	if (fserrno) {
@@ -885,7 +811,8 @@ fs_init_cb(void *ctx, struct spdk_filesystem *fs, int fserrno)
 		goto out;
 	}
 
-	// TODO: check and set features for vhost fs
+	//TODO: set FUSE related virtio features.
+	/* Current no special FUSE related virtio features are defined. */
 	SPDK_DEBUGLOG(SPDK_LOG_VHOST_FS, "Controller %s enable features 0x%lx\n", fvdev->name, features);
 	if (features && rte_vhost_driver_enable_features(fvdev->vdev.path, features)) {
 		SPDK_ERRLOG("Controller %s: failed to enable features 0x%"PRIx64"\n", fvdev->name, features);
@@ -902,12 +829,13 @@ fs_init_cb(void *ctx, struct spdk_filesystem *fs, int fserrno)
 			spdk_bdev_get_name(fvdev->bdev));
 
 out:
-	if (ret != 0 && fvdev) {
-		spdk_dma_free(fvdev);
-	}
 	spdk_vhost_unlock();
 
 	fvdev->cb_fn(fvdev->cb_arg, ret);
+
+	if (ret != 0 && fvdev) {
+		spdk_dma_free(fvdev);
+	}
 }
 
 static void
@@ -919,8 +847,11 @@ __fs_call_fn(void *arg1, void *arg2)
 	fn(arg2);
 }
 
+/* The function for sending sync request to polling thread.
+ * It is not necessary for blobfs async API.
+ */
 static void
-__fs_send_request(fs_request_fn fn, void *arg)
+__blobfs_send_request(fs_request_fn fn, void *arg)
 {
 	struct spdk_event *event;
 
@@ -964,7 +895,7 @@ spdk_vhost_fs_construct(const char *name, const char *cpumask, const char *dev_n
 	fvdev->cb_fn = cb_fn;
 	fvdev->cb_arg = cb_arg;
 	fvdev->name = strdup(name);
-	spdk_fs_load(fvdev->bs_dev, __fs_send_request, fs_init_cb, fvdev);
+	spdk_fs_load(fvdev->bs_dev, __blobfs_send_request, fs_init_cb, fvdev);
 
 	return 0;
 
@@ -975,7 +906,7 @@ err:
 	spdk_vhost_unlock();
 
 	cb_fn(cb_arg, ret);
-	return 0;
+	return -1;
 }
 
 static int

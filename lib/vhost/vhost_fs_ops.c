@@ -44,14 +44,14 @@
 #include "linux/fuse_misc.h"
 #include "../blobfs/blobfs_internal.h"
 
-size_t iov_length(const struct iovec *iov, size_t count)
+static int
+send_reply_none(struct spdk_vhost_fs_task *task, int error)
 {
-	size_t seg;
-	size_t ret = 0;
+	fprintf(stderr, "fuse out none: error is %d, unique is 0x%lx\n",
+			error, task->unique);
 
-	for (seg = 0; seg < count; seg++)
-		ret += iov[seg].iov_len;
-	return ret;
+	fs_request_finish(task, error);
+	return 0;
 }
 
 static int
@@ -73,12 +73,7 @@ send_reply(struct spdk_vhost_fs_task *task, int error)
 	fprintf(stderr, "fuse out header: len is 0x%x error is %d, unique is 0x%lx\n",
 			out->len, out->error, out->unique);
 
-	spdk_vhost_vq_used_ring_enqueue(&task->fvsession->vsession, task->vq, task->req_idx, task->used_len);
-
-		*task->status = error;
-		SPDK_DEBUGLOG(SPDK_LOG_VHOST_BLK, "Finished task (%p) req_idx=%d\n status: %s\n", task,
-			      task->req_idx, !error ? "OK" : "FAIL");
-		fs_task_finish(task);
+	fs_request_finish(task, error);
 	return 0;
 }
 
@@ -94,6 +89,18 @@ fuse_reply_ok(struct spdk_vhost_fs_task *task)
 	return send_reply(task, 0);
 }
 
+static size_t
+iov_length(const struct iovec *iov, size_t count)
+{
+	size_t seg;
+	size_t ret = 0;
+
+	for (seg = 0; seg < count; seg++)
+		ret += iov[seg].iov_len;
+	return ret;
+}
+
+//TODO: can be optimized later; it is aiming to readdir and so on
 static int
 fuse_reply_buf(struct spdk_vhost_fs_task *task, char *buf, uint32_t bufsize)
 {
@@ -114,7 +121,6 @@ fuse_reply_buf(struct spdk_vhost_fs_task *task, char *buf, uint32_t bufsize)
 
 	if (bufrem != 0) {
 		fprintf(stderr, "Failed to send whole buf by in_iovs! Remain 0x%x bytes", bufrem);
-//		assert(false);
 	}
 
 
@@ -188,7 +194,7 @@ static void
 file_stat_async_cb(void *ctx, struct spdk_file_stat *stat, int fserrno)
 {
 	struct spdk_vhost_fs_task *task = ctx;
-	struct stat stbuf;
+	struct stat stbuf = {};
 
 	if (fserrno) {
 		fuse_reply_err(task, -fserrno);
@@ -198,6 +204,7 @@ file_stat_async_cb(void *ctx, struct spdk_file_stat *stat, int fserrno)
 	stbuf.st_mode = S_IFREG | 0644;
 	stbuf.st_nlink = 1;
 	stbuf.st_size = stat->size;
+	stbuf.st_ino = (uint64_t)stbuf.st_ino;
 
 	fuse_reply_attr(task, &stbuf, 0);
 }
@@ -224,22 +231,17 @@ do_getattr(struct spdk_vhost_fs_task *task, uint64_t node_id, const void *in_arg
 	}
 
 	if (node_id == 1) {
-		file_path = "/";
-	} else {
-		SPDK_ERRLOG("node is not root dir, not support yet\n");
-
-		file = (struct spdk_file *)node_id;
-		file_path = spdk_file_get_name(file);
-//		file_path = "/";
-	}
-
-	if (!strcmp(file_path, "/")) {
 		struct stat stbuf = {};
 
 		stbuf.st_mode = S_IFDIR | 0755;
 		stbuf.st_nlink = 2;
+		stbuf.st_ino = 0x12345;
 		fuse_reply_attr(task, &stbuf, 0);
 	} else {
+		file = (struct spdk_file *)node_id;
+		task->u.fp = file;
+		file_path = spdk_file_get_name(file);
+
 		spdk_fs_file_stat_async(task->fvsession->fvdev->fs, file_path, file_stat_async_cb, task);
 	}
 
@@ -424,19 +426,20 @@ do_write(fuse_req_t req, fuse_ino_t nodeid, const void *inarg)
 static int
 do_statfs(struct spdk_vhost_fs_task *task, uint64_t node_id, const void *in_arg)
 {
+	struct fuse_statfs_out *outarg = task->in_iovs[1].iov_base;
+
 	if (1) {
 		fprintf(stderr, "do_statfs\n");
 	}
-	struct fuse_statfs_out *outarg = task->in_iovs[1].iov_base;
 
 	outarg->st.bsize = 4096;
 	outarg->st.namelen = 255;
 
 	task->used_len = sizeof(*outarg);
 
-		fuse_reply_ok(task);
+	fuse_reply_ok(task);
 
-		return 0;
+	return 0;
 }
 
 static int
@@ -532,55 +535,53 @@ do_destroy(struct spdk_vhost_fs_task *task, uint64_t node_id, const void *in_arg
 	return 0;
 }
 
+static void
+_do_lookup_stat(void *ctx, struct spdk_file_stat *stat, int fserrno)
+{
+	struct spdk_vhost_fs_task *task = ctx;
+	struct fuse_entry_out *earg = task->in_iovs[1].iov_base;
+	struct fuse_entryver_out *ever;
+	uint64_t entry_size;
+
+	//TODO: add content for entryver
+	ever = (struct fuse_entryver_out *) (task->in_iovs[1].iov_base + sizeof(struct fuse_entry_out));
+	ever;
+
+	entry_size = sizeof(struct fuse_entry_out) + sizeof(struct fuse_entryver_out);
+	assert(task->in_iovs[1].iov_len >= entry_size);
+
+	memset(earg, 0, entry_size);
+
+	/* Set nodeid to be the memaddr of spdk-file */
+	earg->nodeid = (uint64_t)task->u.fp;
+
+	earg->attr_valid = 0;
+	earg->entry_valid = 0;
+
+	earg->attr.mode = S_IFREG | 0644;
+	earg->attr.nlink = 1;
+	earg->attr.ino = stat->blobid;
+	earg->attr.size = stat->size;
+	earg->attr.blksize = 4096;
+	earg->attr.blocks = (stat->size + 4095) / 4096;
+
+	task->used_len = entry_size;
+
+	fuse_reply_ok(task);
+	return;
+}
 
 static void
 _do_lookup_open(void *ctx, struct spdk_file *f, int fserrno)
 {
 	struct spdk_vhost_fs_task *task = ctx;
-	struct fuse_entry_out *earg = task->in_iovs[1].iov_base;
-//	struct fuse_entryver_out *ever = (struct fuse_entryver_out *) (task->in_iovs[1].iov_base + sizeof(struct fuse_entry_out));
-	uint64_t size;
+	const char *file_path;
 
-	size = sizeof(struct fuse_entry_out) + sizeof(struct fuse_entryver_out);
+	file_path = spdk_file_get_name(f);
+	task->u.fp = f;
 
-//	assert(false);
-	assert(task->in_iovs[1].iov_len >= size);
+	spdk_fs_file_stat_async(task->fvsession->fvdev->fs, file_path, _do_lookup_stat, task);
 
-#if 1
-	memset(earg, 0, size);
-	earg->nodeid = f;
-	earg->attr_valid = 0;
-	earg->entry_valid = 0;
-	earg->attr.mode = S_IFREG | 0644;
-	earg->attr.nlink = 1;
-	earg->attr.ino = f;
-#else
-	uint8_t testbuf[144] = {0x0, 0x94, 0x0, 0x48, 0xaa, 0x7f, 0x0, 0x0, //nodeid
-			 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0,//generation
-			 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0,//entry_valid
-			 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0,//attr_valid
-			 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0,// entry_valid_nsec + attr_valid_nsec
-			 0xfb, 0xf, 0x5a, 0x0, 0x0, 0x0, 0x0, 0x0,//attr--ino
-			 0x5, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0,//attr--size
-			 0x8, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0,//attr--blocks
-			 0xf0, 0x2d, 0x7e, 0x5c, 0x0, 0x0, 0x0, 0x0,//attr--atime
-			 0x8d, 0x2e, 0x6e, 0x5c, 0x0, 0x0, 0x0, 0x0,//attr--mtime
-			 0x8d, 0x2e, 0x6e, 0x5c, 0x0, 0x0, 0x0, 0x0,//attr--ctime
-			 0xbb, 0x73, 0x34, 0x30, 0xce, 0x53, 0xbb, 0x22,//attr--atimensec+mtimenesec
-			 0xce, 0x53, 0xbb, 0x22, 0xa4, 0x81, 0x0, 0x0,//attr--ctimensec + mode
-			 0x1, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0,//attr--nlink+uid
-			 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0,//attr--gid + rdev
-			 0x0, 0x10, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0,//attr--blksize+ padding
-			 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0,
-			 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0,};
-	memcpy(task->in_iovs[1].iov_base, testbuf, 144);
-#endif
-
-
-	task->used_len = size;
-//	spdk_fs_file_stat_async(task->fvsession->fvdev->fs, file_path, file_stat_async_cb, task);
-
-	fuse_reply_ok(task);
 	return;
 }
 
@@ -592,14 +593,12 @@ do_lookup(struct spdk_vhost_fs_task *task, uint64_t node_id, const void *in_arg)
 	const char *filename;
 	spdk_fs_iter iter;
 
-
-
 	if (1) {
 		fprintf(stderr, "do_lookup(parent node_id=%" PRIu64 ", name=%s)\n",
 				node_id, name);
 	}
 
-	// TODO: check whether node id is rootdir
+	/* Directory is not supported yet */
 	if (node_id != 1) {
 		fuse_reply_err(task, ENOSYS);
 		return -1;
@@ -613,6 +612,7 @@ do_lookup(struct spdk_vhost_fs_task *task, uint64_t node_id, const void *in_arg)
 
 		fprintf(stderr, "existed file name is %s, requested filename is %s\n",
 				filename, name);
+		//TODO: verify why filename of blobfs has a prefix '/'
 		if (strcmp(filename + 1, name) == 0) {
 			spdk_fs_open_file_async(task->fvsession->fvdev->fs, filename, 0, _do_lookup_open, task);
 			return 0;
@@ -623,17 +623,30 @@ do_lookup(struct spdk_vhost_fs_task *task, uint64_t node_id, const void *in_arg)
 	return 0;
 }
 
+static void
+_do_forget_close(void *ctx, int fserrno)
+{
+	struct spdk_vhost_fs_task *task = ctx;
+
+	fprintf(stderr, "do_forget done for task %p\n", task);
+	return;
+}
+
+//TODO: add refcount for node_id; it needs more consideration.
 static int
 do_forget(struct spdk_vhost_fs_task *task, uint64_t node_id, const void *in_arg)
 {
 	struct fuse_forget_in *arg = (struct fuse_forget_in *) in_arg;
+	struct spdk_file *file = (struct spdk_file *)node_id;
 
 	if (1) {
 		fprintf(stderr, "do_forget(node_id=%" PRIu64 ", nlookup=%lu)\n",
 				node_id, arg->nlookup);
 	}
 
-	fuse_reply_ok(task);
+	spdk_file_close_async(file, _do_forget_close, task);
+
+	send_reply_none(task, 0);
 
 	return 0;
 }
@@ -641,12 +654,13 @@ do_forget(struct spdk_vhost_fs_task *task, uint64_t node_id, const void *in_arg)
 static int
 do_opendir(struct spdk_vhost_fs_task *task, uint64_t node_id, const void *in_arg)
 {
-	struct fuse_open_in *arg = (struct fuse_open_in *) in_arg;
-	struct fuse_file_info *fi = task->in_iovs[1].iov_base;
+	struct fuse_open_in *i_arg = (struct fuse_open_in *) in_arg;
+	struct fuse_open_out *o_arg = task->in_iovs[1].iov_base;
+	spdk_fs_iter *iter_p;
 
 	if (1) {
 		fprintf(stderr, "do_opendir(node_id=%" PRIu64 ", flags=0x%x, unused=0x%x)\n",
-				node_id, arg->flags, arg->unused);
+				node_id, i_arg->flags, i_arg->unused);
 	}
 
 	/* Only support root dir */
@@ -655,12 +669,12 @@ do_opendir(struct spdk_vhost_fs_task *task, uint64_t node_id, const void *in_arg
 		return -1;
 	}
 
-	memset(fi, 0, sizeof(*fi));
-	fi->flags = arg->flags;
+	iter_p = calloc(1, sizeof(*iter_p));
+	*iter_p = spdk_fs_iter_first(task->fvsession->fvdev->fs);
+	memset(o_arg, 0, sizeof(*o_arg));
+	o_arg->fh = (uint64_t)iter_p;
 
-
-	task->used_len = sizeof(*fi);
-
+	task->used_len = sizeof(*o_arg);
 	fuse_reply_ok(task);
 
 	return 0;
@@ -670,7 +684,6 @@ static int
 do_releasedir(struct spdk_vhost_fs_task *task, uint64_t node_id, const void *in_arg)
 {
 	struct fuse_release_in *arg = (struct fuse_release_in *) in_arg;
-//	struct fuse_file_info fi;
 
 	if (1) {
 		fprintf(stderr, "do_releasedir(node_id=%" PRIu64 ", fh=0x%lx, flags=0x%x, releaseflags=0x%x, lockowner=0x%lx)\n",
@@ -683,7 +696,8 @@ do_releasedir(struct spdk_vhost_fs_task *task, uint64_t node_id, const void *in_
 		return -1;
 	}
 
-		fuse_reply_err(task, 0);
+	free((spdk_fs_iter *)arg->fh);
+	fuse_reply_ok(task);
 
 	return 0;
 }
@@ -692,10 +706,9 @@ static int
 do_readdir(struct spdk_vhost_fs_task *task, uint64_t node_id, const void *in_arg)
 {
 	struct fuse_read_in *arg = (struct fuse_read_in *) in_arg;
-//	struct fuse_file_info fi;
 	struct spdk_file *file;
 	const char *filename;
-	spdk_fs_iter iter;
+	spdk_fs_iter *iter_p = (spdk_fs_iter *)arg->fh;
 	char *buf;
 	uint32_t bufsize, bufoff;
 
@@ -720,73 +733,19 @@ do_readdir(struct spdk_vhost_fs_task *task, uint64_t node_id, const void *in_arg
 	}
 	bufsize = arg->size;
 	bufoff = 0;
-	/* fill .. and . */
-	if (0){
+
+	//TODO: consider situation that bufsize is not enough and require continous readdir cmd
+	while (*iter_p != NULL) {
 		struct fuse_dirent *dirent;
 		size_t entlen;
 		size_t entlen_padded;
 
 		dirent = (struct fuse_dirent *)(buf + bufoff);
-		filename = "..";
-		fprintf(stderr, "Find file %s\n", filename);
 
-		entlen = FUSE_NAME_OFFSET + strlen(filename);
-		entlen_padded = FUSE_DIRENT_ALIGN(entlen);
-		bufoff += entlen_padded;
-		if (bufoff > bufsize) {
-			fprintf(stderr, "bufsize is not enough\n");
-			fuse_reply_err(task, ENOSYS);
-			return -1;
-		}
-
-		// TODO: correct dirent contents
-		dirent->ino = 0x1234;
-		dirent->off = 0;
-		dirent->namelen = strlen(filename);
-		dirent->type =  DT_CHR;
-		strncpy(dirent->name, filename, dirent->namelen);
-		memset(dirent->name + dirent->namelen, 0, entlen_padded - entlen);
-	}
-	if (0){
-		struct fuse_dirent *dirent;
-		size_t entlen;
-		size_t entlen_padded;
-
-		dirent = (struct fuse_dirent *)(buf + bufoff);
-		filename = ".";
-		fprintf(stderr, "Find file %s\n", filename);
-
-		entlen = FUSE_NAME_OFFSET + strlen(filename);
-		entlen_padded = FUSE_DIRENT_ALIGN(entlen);
-		bufoff += entlen_padded;
-		if (bufoff > bufsize) {
-			fprintf(stderr, "bufsize is not enough\n");
-			fuse_reply_err(task, ENOSYS);
-			return -1;
-		}
-
-		// TODO: correct dirent contents
-		dirent->ino = 2345;
-		dirent->off = 0;
-		dirent->namelen = strlen(filename);
-		dirent->type =  DT_CHR;
-		strncpy(dirent->name, filename, dirent->namelen);
-		memset(dirent->name + dirent->namelen, 0, entlen_padded - entlen);
-	}
-
-	iter = spdk_fs_iter_first(task->fvsession->fvdev->fs);
-//	iter = NULL;
-	while (iter != NULL) {
-		struct fuse_dirent *dirent;
-//		size_t namelen;
-		size_t entlen;
-		size_t entlen_padded;
-
-		dirent = (struct fuse_dirent *)(buf + bufoff);
-
-		file = spdk_fs_iter_get_file(iter);
-		iter = spdk_fs_iter_next(iter);
+		file = spdk_fs_iter_get_file(*iter_p);
+		*iter_p = spdk_fs_iter_next(*iter_p);
 		filename = spdk_file_get_name(file);
+
 		fprintf(stderr, "Find file %s\n", filename);
 
 		entlen = FUSE_NAME_OFFSET + strlen(filename) - 1;
@@ -799,13 +758,12 @@ do_readdir(struct spdk_vhost_fs_task *task, uint64_t node_id, const void *in_arg
 		}
 
 		// TODO: correct dirent contents
-		dirent->ino = file;
+		dirent->ino = (uint64_t)file;
 		dirent->off = 0;
 		dirent->namelen = strlen(filename) - 1;
 		dirent->type =  DT_REG;
 		strncpy(dirent->name, filename + 1, dirent->namelen);
 		memset(dirent->name + dirent->namelen, 0, entlen_padded - entlen);
-
 	}
 
 	fuse_reply_buf(task, buf, bufoff);
@@ -818,7 +776,7 @@ static int
 do_nothing(struct spdk_vhost_fs_task *task, uint64_t node_id, const void *in_arg)
 {
 	fuse_reply_err(task, ENOSYS);
-	return 0;
+	return -1;
 }
 
 struct spdk_fuse_op spdk_fuse_ll_ops_array[] = {
