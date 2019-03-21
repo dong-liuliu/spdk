@@ -84,6 +84,7 @@ struct spdk_vhost_fs_task {
 	/* internal ctx for blobfs operation */
 	union {
 		struct spdk_file *fp; // used by lookup
+		uint64_t *file_offset_p; // used by read/write/release...
 	}u;
 };
 

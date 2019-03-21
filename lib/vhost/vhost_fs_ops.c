@@ -218,9 +218,9 @@ do_getattr(struct spdk_vhost_fs_task *task, uint64_t node_id, const void *in_arg
 
 	if (1) {
 		fprintf(stderr, "do_getattr: nodeid is %ld\n", node_id);
-			fprintf(stderr, "getattr_flags=0x%x\n", arg->getattr_flags);
-			fprintf(stderr, "fh=0x%lx\n", arg->fh);
-			fprintf(stderr, "dummy=0x%x\n", arg->dummy);
+		fprintf(stderr, "getattr_flags=0x%x\n", arg->getattr_flags);
+		fprintf(stderr, "fh=0x%lx\n", arg->fh);
+		fprintf(stderr, "dummy=0x%x\n", arg->dummy);
 	}
 
 	if (task->fvsession->cinfo.proto_minor < 9) {
@@ -253,80 +253,196 @@ do_setattr(struct spdk_vhost_fs_task *task, uint64_t node_id, const void *in_arg
 {
 	struct fuse_setattr_in *arg = (struct fuse_setattr_in *) in_arg;
 
-	(void)arg;
+	if (1) {
+		fprintf(stderr, "do_setattr: nodeid is %ld\n", node_id);
+			fprintf(stderr, "valid=0x%x\n", arg->valid);
+			fprintf(stderr, "fh=0x%lx\n", arg->fh);
+			fprintf(stderr, "mode=0x%x\n", arg->mode);
+			fprintf(stderr, "size=0x%lx\n", arg->size);
+	}
 
 	fuse_reply_err(task, ENOSYS);
 	return 0;
 }
 
-#if 0
 static void
-file_open_async_cb(void *ctx, struct spdk_file *f, int fserrno)
+_do_open_open(void *ctx, struct spdk_file *f, int fserrno)
 {
-	struct spdk_fuse_req *req = ctx;
-	struct fuse_file_info *fi;
+	struct spdk_vhost_fs_task *task = ctx;
+	struct fuse_open_out *o_arg = task->in_iovs[1].iov_base;
+	uint64_t *file_offset_p;
 
 	if (fserrno != 0) {
-		fuse_reply_err(req, -fserrno);
+		fuse_reply_err(task, -fserrno);
 		return;
 	}
 
-	// TODO: clarify cache
-	fi->direct_io = 1;
+	file_offset_p = malloc(sizeof(*file_offset_p));
+	*file_offset_p = 0;
 
-	fuse_reply_open(req, &fi);
-}
+	memset(o_arg, 0, sizeof(*o_arg));
+	o_arg->fh = (uint64_t)file_offset_p;
 
-static void
-do_open(struct spdk_fuse_req *req, uint64_t node_id, const void *in_arg)
-{
-	struct fuse_open_in *arg = (struct fuse_open_in *) in_arg;
-	struct fuse_file_info fi;
-	struct spdk_file *file;
-	int rc;
-
-	memset(&fi, 0, sizeof(fi));
-	fi.flags = arg->flags;
-	// TODO: check and add flags
-	fi.flags = ;
-
-	spdk_fs_open_file_async(fs, file_path, flags, file_open_async_cb, req);
-
-	return;
-}
-
-static void
-file_close_async_cb(void *ctx, int fserrno)
-{
-	fuse_reply_err(req, -fserrno);
+	task->used_len = sizeof(*o_arg);
+	fuse_reply_ok(task);
 }
 
 static int
-do_release(fuse_req_t req, fuse_ino_t nodeid, const void *inarg)
+do_open(struct spdk_vhost_fs_task *task, uint64_t node_id, const void *in_arg)
 {
-	struct fuse_release_in *arg = (struct fuse_release_in *) inarg;
-	struct fuse_file_info fi;
+	struct fuse_open_in *arg = (struct fuse_open_in *) in_arg;
+	struct spdk_file *file;
+	const char *file_path;
 
-	memset(&fi, 0, sizeof(fi));
-	fi.flags = arg->flags;
-	fi.fh = arg->fh;
-	if (req->se->conn.proto_minor >= 8) {
-		fi.flush = (arg->release_flags & FUSE_RELEASE_FLUSH) ? 1 : 0;
-		fi.lock_owner = arg->lock_owner;
-	}
-	if (arg->release_flags & FUSE_RELEASE_FLOCK_UNLOCK) {
-		fi.flock_release = 1;
-		fi.lock_owner = arg->lock_owner;
+	if (1) {
+		fprintf(stderr, "do_open: nodeid is %ld\n", node_id);
+		fprintf(stderr, "flags=0x%x\n", arg->flags);
 	}
 
 
-	struct spdk_file *file = (struct spdk_file *)info->fh;
+	file = (struct spdk_file *)node_id;
+	task->u.fp = file;
+	file_path = spdk_file_get_name(file);
 
-	spdk_file_close_async(file, );
+	//TODO: adopt open flags, especially for o_create
+	(void)arg->flags;
+
+	spdk_fs_open_file_async(task->fvsession->fvdev->fs, file_path, 0, _do_open_open, task);
 
 	return 0;
 }
 
+static void
+_do_read_read(void *ctx, int fserrno)
+{
+	struct spdk_vhost_fs_task *task = ctx;
+
+	if (fserrno) {
+		fprintf(stderr, "_do_read_read: failed %d\n", fserrno);
+		fuse_reply_err(task, -fserrno);
+		return;
+	}
+
+	fuse_reply_ok(task);
+	return;
+}
+
+static int
+do_read(struct spdk_vhost_fs_task *task, uint64_t node_id, const void *in_arg)
+{
+	struct fuse_read_in *arg = (struct fuse_read_in *) in_arg;
+	struct spdk_file *file;
+	struct spdk_io_channel *sync_io_channel;
+	char *payload;
+	uint64_t length;
+
+	if (1) {
+		fprintf(stderr, "do_read: nodeid is %ld\n", node_id);
+		fprintf(stderr, "fh=0x%lx\n", arg->fh);
+		fprintf(stderr, "offset=0x%lx\n", arg->offset);
+		fprintf(stderr, "size=0x%x\n", arg->size);
+		fprintf(stderr, "lock_owner=0x%lx\n", arg->lock_owner);
+		fprintf(stderr, "read_flags=0x%x\n", arg->read_flags);
+		fprintf(stderr, "flags=0x%x\n", arg->flags);
+	}
+
+	file = (struct spdk_file *)node_id;
+	task->u.file_offset_p = (uint64_t *)arg->fh;
+
+	sync_io_channel = spdk_fs_get_sync_io_channel(task->fvsession->fvdev->fs);
+	//TODO: support file'size larger than the first in_iov page
+	payload = task->in_iovs[1].iov_base;
+	length = spdk_min(task->in_iovs[1].iov_len, arg->size);
+	if (arg->offset >= spdk_file_get_length(file)) {
+
+		fuse_reply_ok(task);
+		return 1;
+	}
+
+	length = spdk_min(length, spdk_file_get_length(file) - arg->offset);
+	//TODO: used_len should be updated in callback, not here
+	task->used_len = length;
+
+	spdk_file_read_async(file, sync_io_channel, payload, arg->offset, length, _do_read_read, task);
+
+	return 0;
+}
+
+static void
+_do_release_close(void *ctx, int fserrno)
+{
+	struct spdk_vhost_fs_task *task = ctx;
+
+	if (fserrno) {
+		fprintf(stderr, "do_release_close: failed %d\n", fserrno);
+	}
+
+	free(task->u.file_offset_p);
+	*task->u.file_offset_p = 0;
+	fuse_reply_err(task, -fserrno);
+	return;
+}
+
+static int
+do_release(struct spdk_vhost_fs_task *task, uint64_t node_id, const void *in_arg)
+{
+	struct fuse_release_in *arg = (struct fuse_release_in *) in_arg;
+	struct spdk_file *file;
+	const char *file_path;
+
+	if (1) {
+		fprintf(stderr, "do_release: nodeid is %ld\n", node_id);
+		fprintf(stderr, "fh=0x%lx\n", arg->fh);
+		fprintf(stderr, "lock_owner=0x%lx\n", arg->lock_owner);
+		fprintf(stderr, "release_flags=0x%x\n", arg->release_flags);
+		fprintf(stderr, "flags=0x%x\n", arg->flags);
+	}
+
+
+	file = (struct spdk_file *)node_id;
+	task->u.file_offset_p = (uint64_t *)arg->fh;
+	file_path = spdk_file_get_name(file);
+	(void)file_path;
+
+	spdk_file_close_async(file, _do_release_close, task);
+
+	return 0;
+}
+
+static void
+_do_flush_sync(void *ctx, int fserrno)
+{
+	struct spdk_vhost_fs_task *task = ctx;
+
+	if (fserrno) {
+		fprintf(stderr, "_do_flush_sync: failed %d\n", fserrno);
+	}
+
+	fuse_reply_err(task, -fserrno);
+	return;
+}
+
+static int
+do_flush(struct spdk_vhost_fs_task *task, uint64_t node_id, const void *in_arg)
+{
+	struct fuse_flush_in *arg = (struct fuse_flush_in *) in_arg;
+	struct spdk_file *file;
+	struct spdk_io_channel *md_io_channel;
+
+	if (1) {
+		fprintf(stderr, "do_flush: nodeid is %ld\n", node_id);
+		fprintf(stderr, "fh=0x%lx\n", arg->fh);
+		fprintf(stderr, "lock_owner=0x%lx\n", arg->lock_owner);
+	}
+
+	md_io_channel = spdk_fs_get_md_io_channel(task->fvsession->fvdev->fs);;
+	file = (struct spdk_file *)node_id;
+	spdk_file_sync_async(file, md_io_channel, _do_flush_sync, task);
+
+	return 0;
+}
+
+#if 0
 static int
 do_create(fuse_req_t req, fuse_ino_t nodeid, const void *inarg)
 {
@@ -350,50 +466,6 @@ do_create(fuse_req_t req, fuse_ino_t nodeid, const void *inarg)
 	return 0;
 }
 
-
-static int
-do_flush(fuse_req_t req, fuse_ino_t nodeid, const void *inarg)
-{
-//	struct fuse_flush_in *arg = (struct fuse_flush_in *) inarg;
-//	struct fuse_file_info fi;
-//
-//	memset(&fi, 0, sizeof(fi));
-//	fi.fh = arg->fh;
-//	fi.flush = 1;
-//	if (req->se->conn.proto_minor >= 7)
-//		fi.lock_owner = arg->lock_owner;
-
-//	spdk_file_sync_async();
-
-//	if (req->se->op.flush)
-//		req->se->op.flush(req, nodeid, &fi);
-//	else
-//		fuse_reply_err(req, ENOSYS);
-
-	fuse_reply_err(req, 0);
-
-	return 0;
-}
-
-
-static void
-do_read(fuse_req_t req, fuse_ino_t nodeid, const void *inarg)
-{
-	struct fuse_read_in *arg = (struct fuse_read_in *) inarg;
-
-	if (req->se->op.read) {
-		struct fuse_file_info fi;
-
-		memset(&fi, 0, sizeof(fi));
-		fi.fh = arg->fh;
-		if (req->se->conn.proto_minor >= 9) {
-			fi.lock_owner = arg->lock_owner;
-			fi.flags = arg->flags;
-		}
-		req->se->op.read(req, nodeid, arg->size, arg->offset, &fi);
-	} else
-		fuse_reply_err(req, ENOSYS);
-}
 
 static void
 do_write(fuse_req_t req, fuse_ino_t nodeid, const void *inarg)
@@ -545,7 +617,7 @@ _do_lookup_stat(void *ctx, struct spdk_file_stat *stat, int fserrno)
 
 	//TODO: add content for entryver
 	ever = (struct fuse_entryver_out *) (task->in_iovs[1].iov_base + sizeof(struct fuse_entry_out));
-	ever;
+	(void)ever;
 
 	entry_size = sizeof(struct fuse_entry_out) + sizeof(struct fuse_entryver_out);
 	assert(task->in_iovs[1].iov_len >= entry_size);
@@ -554,7 +626,6 @@ _do_lookup_stat(void *ctx, struct spdk_file_stat *stat, int fserrno)
 
 	/* Set nodeid to be the memaddr of spdk-file */
 	earg->nodeid = (uint64_t)task->u.fp;
-
 	earg->attr_valid = 0;
 	earg->entry_valid = 0;
 
@@ -793,12 +864,13 @@ struct spdk_fuse_op spdk_fuse_ll_ops_array[] = {
 	[FUSE_READDIR]	   = { do_readdir,     "READDIR"     },
 	[FUSE_RELEASEDIR]  = { do_releasedir,  "RELEASEDIR"  },
 
+	[FUSE_OPEN]	   = { do_open,	       "OPEN"	     },
+	[FUSE_READ]	   = { do_read,	       "READ"	     },
+	[FUSE_RELEASE]	   = { do_release,     "RELEASE"     },
+	[FUSE_FLUSH]	   = { do_flush,       "FLUSH"	     },
+
 #if 1
-	[FUSE_OPEN]	   = { do_nothing,	       "OPEN"	     },
-	[FUSE_READ]	   = { do_nothing,	       "READ"	     },
 	[FUSE_WRITE]	   = { do_nothing,       "WRITE"	     },
-	[FUSE_RELEASE]	   = { do_nothing,     "RELEASE"     },
-	[FUSE_FLUSH]	   = { do_nothing,       "FLUSH"	     },
 	[FUSE_CREATE]	   = { do_nothing,      "CREATE"	     },
 
 	[FUSE_READLINK]	   = { do_nothing,    "READLINK"    },
