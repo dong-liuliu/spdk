@@ -85,6 +85,8 @@ struct spdk_vhost_fs_task {
 	union {
 		struct spdk_file *fp; // used by lookup
 		uint64_t *file_offset_p; // used by read/write/release...
+		char *filepath; // used by create
+		struct fuse_write_in *arg; // used by write
 	}u;
 };
 
