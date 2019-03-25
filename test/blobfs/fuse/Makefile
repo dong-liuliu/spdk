@@ -44,6 +44,6 @@ SPDK_LIB_LIST += event_bdev event_copy
 SPDK_LIB_LIST += bdev copy event thread util conf trace \
 		log jsonrpc json rpc sock
 
-LIBS+= -L/usr/local/lib -lfuse3
+LIBS+= -L/usr/lib64 -lfuse3
 
 include $(SPDK_ROOT_DIR)/mk/spdk.app.mk
