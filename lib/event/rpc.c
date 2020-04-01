@@ -52,6 +52,7 @@ spdk_rpc_subsystem_poll(void *arg)
 	return -1;
 }
 
+// CHANGE: edriven
 void
 spdk_rpc_initialize(const char *listen_addr)
 {
@@ -76,12 +77,15 @@ spdk_rpc_initialize(const char *listen_addr)
 	spdk_rpc_set_state(SPDK_RPC_STARTUP);
 
 	/* Register a poller to periodically check for RPCs */
-	g_rpc_poller = spdk_poller_register(spdk_rpc_subsystem_poll, NULL, RPC_SELECT_INTERVAL);
+//	g_rpc_poller = spdk_poller_register(spdk_rpc_subsystem_poll, NULL, RPC_SELECT_INTERVAL);
+	g_rpc_poller = spdk_thread_edriven_interval_register(spdk_rpc_subsystem_poll, NULL, RPC_SELECT_INTERVAL, NULL);
 }
 
+// CHANGE: edriven
 void
 spdk_rpc_finish(void)
 {
 	spdk_rpc_close();
-	spdk_poller_unregister(&g_rpc_poller);
+//	spdk_poller_unregister(&g_rpc_poller);
+	spdk_thread_edriven_unregister(&g_rpc_poller);
 }
