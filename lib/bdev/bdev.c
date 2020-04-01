@@ -2317,9 +2317,11 @@ bdev_enable_qos(struct spdk_bdev *bdev, struct spdk_bdev_channel *ch)
 			qos->timeslice_size =
 				SPDK_BDEV_QOS_TIMESLICE_IN_USEC * spdk_get_ticks_hz() / SPDK_SEC_TO_USEC;
 			qos->last_timeslice = spdk_get_ticks();
-			qos->poller = spdk_poller_register(bdev_channel_poll_qos,
-							   qos,
-							   SPDK_BDEV_QOS_TIMESLICE_IN_USEC);
+			//qos->poller = spdk_poller_register(bdev_channel_poll_qos,
+			//				   qos,
+			//				   SPDK_BDEV_QOS_TIMESLICE_IN_USEC);
+			qos->poller = spdk_thread_edriven_interval_register(bdev_channel_poll_qos, qos,
+					SPDK_BDEV_QOS_TIMESLICE_IN_USEC, NULL);
 		}
 
 		ch->flags |= BDEV_CH_QOS_ENABLED;
@@ -2433,14 +2435,19 @@ spdk_bdev_set_timeout(struct spdk_bdev_desc *desc, uint64_t timeout_in_sec,
 {
 	assert(desc->thread == spdk_get_thread());
 
-	spdk_poller_unregister(&desc->io_timeout_poller);
+//	spdk_poller_unregister(&desc->io_timeout_poller);
+	spdk_thread_edriven_unregister(&desc->io_timeout_poller);
 
 	if (timeout_in_sec) {
 		assert(cb_fn != NULL);
-		desc->io_timeout_poller = spdk_poller_register(bdev_poll_timeout_io,
+//		desc->io_timeout_poller = spdk_poller_register(bdev_poll_timeout_io,
+//					  desc,
+//					  SPDK_BDEV_IO_POLL_INTERVAL_IN_MSEC * SPDK_SEC_TO_USEC /
+//					  1000);
+		desc->io_timeout_poller = spdk_thread_edriven_interval_register(bdev_poll_timeout_io,
 					  desc,
 					  SPDK_BDEV_IO_POLL_INTERVAL_IN_MSEC * SPDK_SEC_TO_USEC /
-					  1000);
+					  1000, NULL);
 		if (desc->io_timeout_poller == NULL) {
 			SPDK_ERRLOG("can not register the desc timeout IO poller\n");
 			return -1;
@@ -2619,7 +2626,8 @@ bdev_qos_channel_destroy(void *cb_arg)
 	struct spdk_bdev_qos *qos = cb_arg;
 
 	spdk_put_io_channel(spdk_io_channel_from_ctx(qos->ch));
-	spdk_poller_unregister(&qos->poller);
+//	spdk_poller_unregister(&qos->poller);
+	spdk_thread_edriven_unregister(&qos->poller);
 
 	SPDK_DEBUGLOG(SPDK_LOG_BDEV, "Free QoS %p.\n", qos);
 
@@ -3039,13 +3047,17 @@ spdk_bdev_set_qd_sampling_period(struct spdk_bdev *bdev, uint64_t period)
 	bdev->internal.period = period;
 
 	if (bdev->internal.qd_poller != NULL) {
-		spdk_poller_unregister(&bdev->internal.qd_poller);
+//		spdk_poller_unregister(&bdev->internal.qd_poller);
+		spdk_thread_edriven_unregister(&bdev->internal.qd_poller);
+
 		bdev->internal.measured_queue_depth = UINT64_MAX;
 	}
 
 	if (period != 0) {
-		bdev->internal.qd_poller = spdk_poller_register(bdev_calculate_measured_queue_depth, bdev,
-					   period);
+//		bdev->internal.qd_poller = spdk_poller_register(bdev_calculate_measured_queue_depth, bdev,
+//					   period);
+		bdev->internal.qd_poller = spdk_thread_edriven_interval_register(bdev_calculate_measured_queue_depth, bdev,
+					   period, NULL);
 	}
 }
 
@@ -5366,7 +5378,9 @@ spdk_bdev_close(struct spdk_bdev_desc *desc)
 
 	assert(desc->thread == spdk_get_thread());
 
-	spdk_poller_unregister(&desc->io_timeout_poller);
+//	spdk_poller_unregister(&desc->io_timeout_poller);
+	spdk_thread_edriven_unregister(&desc->io_timeout_poller);
+
 
 	pthread_mutex_lock(&bdev->internal.mutex);
 	pthread_mutex_lock(&desc->mutex);
@@ -5628,7 +5642,8 @@ bdev_disable_qos_done(void *cb_arg)
 
 	if (qos->thread != NULL) {
 		spdk_put_io_channel(spdk_io_channel_from_ctx(qos->ch));
-		spdk_poller_unregister(&qos->poller);
+//		spdk_poller_unregister(&qos->poller);
+		spdk_thread_edriven_unregister(&qos->poller);
 	}
 
 	free(qos);
@@ -6136,7 +6151,8 @@ bdev_lock_lba_range_check_io(void *_i)
 	struct lba_range *range = ctx->current_range;
 	struct spdk_bdev_io *bdev_io;
 
-	spdk_poller_unregister(&ctx->poller);
+//	spdk_poller_unregister(&ctx->poller);
+	spdk_thread_edriven_unregister(&ctx->poller);
 
 	/* The range is now in the locked_ranges, so no new IO can be submitted to this
 	 * range.  But we need to wait until any outstanding IO overlapping with this range
@@ -6144,7 +6160,8 @@ bdev_lock_lba_range_check_io(void *_i)
 	 */
 	TAILQ_FOREACH(bdev_io, &ch->io_submitted, internal.ch_link) {
 		if (bdev_io_range_is_locked(bdev_io, range)) {
-			ctx->poller = spdk_poller_register(bdev_lock_lba_range_check_io, i, 100);
+//			ctx->poller = spdk_poller_register(bdev_lock_lba_range_check_io, i, 100);
+			ctx->poller = spdk_thread_edriven_interval_register(bdev_lock_lba_range_check_io, i, 100);
 			return 1;
 		}
 	}
