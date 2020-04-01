@@ -180,27 +180,34 @@ _free_thread(struct spdk_thread *thread)
 			    thread->name, ch->dev->name);
 	}
 
+	// CHANGED: edriven
 	TAILQ_FOREACH_SAFE(poller, &thread->active_pollers, tailq, ptmp) {
-		if (poller->state != SPDK_POLLER_STATE_UNREGISTERED) {
+//		if (poller->state != SPDK_POLLER_STATE_UNREGISTERED) {
 			SPDK_WARNLOG("poller %s still registered at thread exit\n",
 				     poller->name);
-		}
+//		}
 		TAILQ_REMOVE(&thread->active_pollers, poller, tailq);
+		spdk_thread_edriven_unregister(&poller);
 		free(poller);
 	}
 
+	// CHANGED: edriven
 	TAILQ_FOREACH_SAFE(poller, &thread->timed_pollers, tailq, ptmp) {
-		if (poller->state != SPDK_POLLER_STATE_UNREGISTERED) {
+//		if (poller->state != SPDK_POLLER_STATE_UNREGISTERED) {
 			SPDK_WARNLOG("poller %s still registered at thread exit\n",
 				     poller->name);
-		}
+//		}
 		TAILQ_REMOVE(&thread->timed_pollers, poller, tailq);
+		spdk_thread_edriven_unregister(&poller);
 		free(poller);
 	}
 
+	// CHANGED: edriven
 	TAILQ_FOREACH_SAFE(poller, &thread->paused_pollers, tailq, ptmp) {
 		SPDK_WARNLOG("poller %s still registered at thread exit\n", poller->name);
 		TAILQ_REMOVE(&thread->paused_pollers, poller, tailq);
+
+		spdk_thread_edriven_unregister(&poller);
 		free(poller);
 	}
 
@@ -222,6 +229,10 @@ _free_thread(struct spdk_thread *thread)
 	}
 
 	assert(thread->msg_cache_count == 0);
+
+	// CHANGED: edriven
+	int rc = spdk_reactor_edriven_destroy_thread(thread);
+	assert(rc == 0);
 
 	spdk_ring_free(thread->messages);
 	free(thread);
@@ -294,6 +305,10 @@ spdk_thread_create(const char *name, struct spdk_cpuset *cpumask)
 	SPDK_DEBUGLOG(SPDK_LOG_THREAD, "Allocating new thread (%" PRIu64 ", %s)\n",
 		      thread->id, thread->name);
 
+	// CHANGED: edriven
+	rc = spdk_reactor_edriven_create_thread(thread);
+	assert(rc == 0);
+
 	if (g_new_thread_fn) {
 		rc = g_new_thread_fn(thread);
 	} else if (g_thread_op_supported_fn && g_thread_op_supported_fn(SPDK_THREAD_OP_NEW)) {
@@ -330,6 +345,7 @@ spdk_thread_exit(struct spdk_thread *thread)
 		return -EINVAL;
 	}
 
+	// TODO: edriven
 	TAILQ_FOREACH(poller, &thread->active_pollers, tailq) {
 		if (poller->state != SPDK_POLLER_STATE_UNREGISTERED) {
 			SPDK_ERRLOG("thread %s still has active poller %s\n",
@@ -338,6 +354,7 @@ spdk_thread_exit(struct spdk_thread *thread)
 		}
 	}
 
+	// TODO: edriven
 	TAILQ_FOREACH(poller, &thread->timed_pollers, tailq) {
 		if (poller->state != SPDK_POLLER_STATE_UNREGISTERED) {
 			SPDK_ERRLOG("thread %s still has active timed poller %s\n",
@@ -346,6 +363,7 @@ spdk_thread_exit(struct spdk_thread *thread)
 		}
 	}
 
+	// TODO: edriven
 	TAILQ_FOREACH(poller, &thread->paused_pollers, tailq) {
 		SPDK_ERRLOG("thread %s still has paused poller %s\n",
 			    thread->name, poller->name);
@@ -361,6 +379,12 @@ spdk_thread_exit(struct spdk_thread *thread)
 	}
 
 	thread->exit = true;
+
+	// TODO: edriven
+	//spdk_reactor_event_notify();
+	// or?
+	//rc = spdk_reactor_edriven_remove_thread(reactor->lcore, thread);
+
 	return 0;
 }
 
@@ -442,6 +466,7 @@ spdk_thread_get_from_ctx(void *ctx)
 	return SPDK_CONTAINEROF(ctx, struct spdk_thread, ctx);
 }
 
+// TODO: edriven
 static inline uint32_t
 _spdk_msg_queue_run_batch(struct spdk_thread *thread, uint32_t max_msgs)
 {
@@ -466,6 +491,8 @@ _spdk_msg_queue_run_batch(struct spdk_thread *thread, uint32_t max_msgs)
 	count = spdk_ring_dequeue(thread->messages, messages, max_msgs);
 	if (count == 0) {
 		return 0;
+	} else if (spdk_ring_count(thread->messages) == 0) {
+		spdk_thread_msg_level_clear(thread);
 	}
 
 	for (i = 0; i < count; i++) {
@@ -509,6 +536,21 @@ _spdk_poller_insert_timer(struct spdk_thread *thread, struct spdk_poller *poller
 	TAILQ_INSERT_HEAD(&thread->timed_pollers, poller, tailq);
 }
 
+void
+spdk_thread_insert_edriven(struct spdk_thread *thread, struct spdk_edriven_event_source *event_src)
+{
+	struct spdk_poller *poller = event_src;
+	TAILQ_INSERT_TAIL(&thread->active_pollers, poller, tailq);
+}
+
+void
+spdk_thread_remove_edriven(struct spdk_thread *thread, struct spdk_edriven_event_source *event_src)
+{
+	struct spdk_poller *poller = event_src;
+	TAILQ_REMOVE(&thread->active_pollers, poller, tailq);
+}
+
+
 static void
 _spdk_thread_insert_poller(struct spdk_thread *thread, struct spdk_poller *poller)
 {
@@ -532,6 +574,42 @@ _spdk_thread_update_stats(struct spdk_thread *thread, uint64_t now, int rc)
 	thread->tsc_last = now;
 }
 
+
+// CHANGE: edriven
+/* process thread msg and critical msg */
+int
+spdk_thread_msg_queue_edriven(void *cb_arg)
+{
+	struct spdk_thread *thread = cb_arg;
+	struct spdk_thread *orig_thread;
+	int rc;
+	uint32_t msg_count;
+	spdk_msg_fn critical_msg;
+	struct spdk_poller *poller, *tmp;
+	int rc = 0;
+	uint64_t now = spdk_get_ticks();
+
+	orig_thread = _get_thread();
+	tls_thread = thread;
+
+	critical_msg = thread->critical_msg;
+	if (spdk_unlikely(critical_msg != NULL)) {
+		critical_msg(NULL);
+		thread->critical_msg = NULL;
+	}
+
+	msg_count = _spdk_msg_queue_run_batch(thread, 0);
+	if (msg_count) {
+		rc = 1;
+	}
+
+	_spdk_thread_update_stats(thread, now, rc);
+
+	tls_thread = orig_thread;
+
+	return rc;
+}
+
 static int
 _spdk_thread_poll(struct spdk_thread *thread, uint32_t max_msgs, uint64_t now)
 {
@@ -546,11 +624,13 @@ _spdk_thread_poll(struct spdk_thread *thread, uint32_t max_msgs, uint64_t now)
 		thread->critical_msg = NULL;
 	}
 
+	// TODO done: edriven: covered by  spdk_thread_msg_queue_edriven
 	msg_count = _spdk_msg_queue_run_batch(thread, max_msgs);
 	if (msg_count) {
 		rc = 1;
 	}
 
+	// TODO: covered by  _reactor_edriven_thread_main
 	TAILQ_FOREACH_REVERSE_SAFE(poller, &thread->active_pollers,
 				   active_pollers_head, tailq, tmp) {
 		int poller_rc;
@@ -589,6 +669,7 @@ _spdk_thread_poll(struct spdk_thread *thread, uint32_t max_msgs, uint64_t now)
 		}
 	}
 
+	// TODO: covered by  timerfd cb
 	TAILQ_FOREACH_SAFE(poller, &thread->timed_pollers, tailq, tmp) {
 		int timer_rc = 0;
 
@@ -698,6 +779,7 @@ spdk_thread_has_pollers(struct spdk_thread *thread)
 	return true;
 }
 
+// TODO: edriven
 bool
 spdk_thread_is_idle(struct spdk_thread *thread)
 {
@@ -821,6 +903,9 @@ spdk_thread_send_msg(const struct spdk_thread *thread, spdk_msg_fn fn, void *ctx
 		return -EIO;
 	}
 
+	// CHANGE: edriven
+	rc = spdk_thread_msg_notify(thread);
+
 	return 0;
 }
 
@@ -831,6 +916,10 @@ spdk_thread_send_critical_msg(struct spdk_thread *thread, spdk_msg_fn fn)
 
 	if (__atomic_compare_exchange_n(&thread->critical_msg, &expected, fn, false, __ATOMIC_SEQ_CST,
 					__ATOMIC_SEQ_CST)) {
+
+		// CHANGE: edriven
+		int rc = spdk_thread_msg_notify(thread);
+		assert(rc == 0);
 		return 0;
 	}
 
@@ -905,6 +994,58 @@ spdk_poller_register_named(spdk_poller_fn fn,
 			   const char *name)
 {
 	return _spdk_poller_register(fn, arg, period_microseconds, name);
+}
+
+
+int
+spdk_edriven_interval_register(spdk_poller_fn fn,
+	      void *arg,
+	      uint64_t period_microseconds,
+	      const char *name)
+{
+	struct spdk_thread *thread;
+	int rc;
+
+	thread = spdk_get_thread();
+	if (!thread) {
+		assert(false);
+		return NULL;
+	}
+
+	if (spdk_unlikely(thread->exit)) {
+		SPDK_ERRLOG("thread %s is marked as exited\n", thread->name);
+		return NULL;
+	}
+
+	rc = spdk_thread_edriven_interval_register(thread, fn, arg, period_microseconds, name);
+	assert(rc == 0);
+
+	return rc;
+}
+
+int
+spdk_edriven_event_register(spdk_poller_fn fn,
+	      void *arg,
+	      const char *name)
+{
+	struct spdk_thread *thread;
+	int rc;
+
+	thread = spdk_get_thread();
+	if (!thread) {
+		assert(false);
+		return NULL;
+	}
+
+	if (spdk_unlikely(thread->exit)) {
+		SPDK_ERRLOG("thread %s is marked as exited\n", thread->name);
+		return NULL;
+	}
+
+	rc = spdk_thread_edriven_event_register(thread, fn, arg, name);
+	assert(rc == 0);
+
+	return rc;
 }
 
 void

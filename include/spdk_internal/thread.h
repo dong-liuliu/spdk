@@ -108,6 +108,10 @@ struct spdk_thread {
 	SLIST_HEAD(, spdk_msg)		msg_cache;
 	size_t				msg_cache_count;
 	spdk_msg_fn			critical_msg;
+
+	struct reactor_edriven_ctx *thd_ectx;
+	struct spdk_edriven_event_source *thd_event_src;
+
 	/* User context allocated at the end */
 	uint8_t				ctx[0];
 };
