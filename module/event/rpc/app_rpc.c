@@ -192,6 +192,7 @@ rpc_thread_get_stats_for_each(struct spdk_jsonrpc_request *request, spdk_msg_fn 
 	spdk_for_each_thread(fn, ctx, rpc_thread_get_stats_done);
 }
 
+// TODO: edriven
 static void
 rpc_thread_get_stats(void *arg)
 {
@@ -243,6 +244,7 @@ spdk_rpc_thread_get_stats(struct spdk_jsonrpc_request *request,
 
 SPDK_RPC_REGISTER("thread_get_stats", spdk_rpc_thread_get_stats, SPDK_RPC_RUNTIME)
 
+// TODO: edriven
 static void
 rpc_get_poller(struct spdk_poller *poller, struct spdk_json_write_ctx *w)
 {
