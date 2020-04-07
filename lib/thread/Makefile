@@ -38,7 +38,7 @@ SO_VER := 3
 SO_MINOR := 0
 SO_SUFFIX := $(SO_VER).$(SO_MINOR)
 
-C_SRCS = thread.c
+C_SRCS = thread.c edriven.c
 LIBNAME = thread
 
 include $(SPDK_ROOT_DIR)/mk/spdk.lib.mk

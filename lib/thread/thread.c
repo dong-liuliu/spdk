@@ -169,30 +169,6 @@ spdk_thread_lib_fini(void)
 	g_ctx_sz = 0;
 }
 
-
-
-// CHANGED: edriven
-extern int spdk_thread_msg_notify(struct spdk_thread *thread);
-extern int spdk_thread_msg_level_clear(struct spdk_thread *thread);
-extern struct spdk_edriven_event_source *spdk_thread_edriven_register(spdk_poller_fn fn, void *arg,
-		const char *name);
-
-/* register a timerfd to thread epfd.
- * A replacement to spdk_poller_register(,,period_microseconds,);
- */
-extern struct spdk_edriven_event_source *spdk_thread_edriven_interval_register(spdk_poller_fn fn, void *arg,
-	      uint64_t period_microseconds, const char *name);
-
-extern int spdk_thread_edriven_unregister(struct spdk_edriven_event_source **pesrc);
-extern int spdk_reactor_edriven_create_thread(struct spdk_thread *thread);
-
-extern int spdk_reactor_edriven_add_thread(uint32_t current_core, struct spdk_thread *thread);
-
-extern int spdk_reactor_edriven_remove_thread(uint32_t current_core, struct spdk_thread *thread);
-
-extern int spdk_reactor_edriven_destroy_thread(struct spdk_thread *thread);
-
-
 void
 spdk_thread_remove_edriven(struct spdk_thread *thread, struct spdk_edriven_event_source *event_src);
 void

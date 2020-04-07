@@ -20,19 +20,17 @@
 
 #include "spdk/queue.h"
 
+#include "spdk_internal/edriven.h"
+
 //~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-extern int spdk_reactor_event_callback(void *cb_arg);
 
+// defined in thread.c
 extern int spdk_reactor_edriven_thread_main(void *cb_arg);
-
 extern int spdk_thread_msg_queue_edriven(void *cb_arg);
 extern void spdk_thread_insert_edriven(struct spdk_thread *thread, struct spdk_edriven_event_source *event_src);
 extern void spdk_thread_remove_edriven(struct spdk_thread *thread, struct spdk_edriven_event_source *event_src);
 
-
 //~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-/** Function to be registered for the specific interrupt */
-typedef int (*reactor_edriven_callback_fn)(void *cb_arg);
 
 struct reactor_edriven_callback {
 	TAILQ_ENTRY(reactor_edriven_callback) next;
@@ -81,10 +79,17 @@ static int edriven_ctx_add_eventfd(struct reactor_edriven_ctx *ectx,
 static int edriven_callback_unregister(struct reactor_edriven_ctx *ectx,
 		struct spdk_edriven_event_source *event_src, reactor_edriven_callback_fn fn);
 
-static int
-reactor_edriven_init(int lcore_idx)
+
+
+struct reactor_edriven_ctx *
+spdk_reactor_edriven_get_ctx(int lcore_idx)
 {
-	struct spdk_reactor *reactor = spdk_reactor_get(lcore_idx);
+	return &g_edriven_ctx[lcore_idx];
+}
+
+int
+spdk_reactor_edriven_init(int lcore_idx, reactor_edriven_callback_fn cb, void *cb_arg)
+{
 	struct reactor_edriven_ctx *reactor_ectx = &g_edriven_ctx[lcore_idx];
 	struct spdk_edriven_event_source_list *edriven_sources;
 	int rc;
@@ -97,32 +102,19 @@ reactor_edriven_init(int lcore_idx)
 	reactor_ectx->epfd = epoll_create1(EPOLL_CLOEXEC);
 	assert(reactor_ectx->epfd);
 
-	rc = edriven_ctx_add_eventfd(reactor_ectx, spdk_reactor_event_callback, reactor);
+	rc = edriven_ctx_add_eventfd(reactor_ectx, cb, cb_arg);
 	assert(rc);
 
 	return rc;
 }
 
-int
-spdk_reactors_edriven_init(int num_lcores)
-{
-	int i, rc;
-
-	for (i = 0; i < num_lcores; i++) {
-		rc = reactor_edriven_init(i);
-		assert(rc == 0);
-	}
-
-	return 0;
-}
-
 static int
-reactor_edriven_fini(int lcore_idx)
+reactor_edriven_fini(int lcore_idx, reactor_edriven_callback_fn cb)
 {
 	struct reactor_edriven_ctx *reactor_ectx = &g_edriven_ctx[lcore_idx];
 
 	/* register efd for msg queue to thread epfd */
-	int rc = edriven_callback_unregister(reactor_ectx, reactor_ectx->event_src, spdk_reactor_event_callback);
+	int rc = edriven_callback_unregister(reactor_ectx, reactor_ectx->event_src, cb);
 	assert(rc == 0);
 
 	close(reactor_ectx->epfd);
@@ -131,12 +123,12 @@ reactor_edriven_fini(int lcore_idx)
 }
 
 int
-spdk_reactors_edriven_fini(int num_lcores)
+spdk_reactors_edriven_fini(int num_lcores, reactor_edriven_callback_fn cb)
 {
 	int i, rc;
 
 	for (i = 0; i < num_lcores; i++) {
-		rc = reactor_edriven_fini(i);
+		rc = reactor_edriven_fini(i, cb);
 		assert(rc == 0);
 	}
 
@@ -165,8 +157,9 @@ _reactor_edriven_process(struct epoll_event *events, int nfds)
 }
 
 int
-spdk_reactor_edriven_epoll_wait(struct reactor_edriven_ctx *ectx, int timeout)
+spdk_reactor_edriven_epoll_wait(void *edriven_ctx, int timeout)
 {
+	struct reactor_edriven_ctx *ectx = edriven_ctx;
 	struct epoll_event *events;
 	int totalfds = 0;
 	int nfds;
@@ -196,17 +189,6 @@ spdk_reactor_edriven_epoll_wait(struct reactor_edriven_ctx *ectx, int timeout)
 	}
 
 	_reactor_edriven_process(events, nfds);
-
-	return 0;
-}
-
-int
-spdk_reactor_edriven_main(struct spdk_reactor *reactor)
-{
-	struct reactor_edriven_ctx *reactor_ctx = &g_edriven_ctx[reactor->lcore];
-	int nonblock_timeout = -1; //_EPOLL_WAIT_FOREVER;
-
-	spdk_reactor_edriven_epoll_wait(reactor_ctx, nonblock_timeout);
 
 	return 0;
 }
@@ -491,6 +473,7 @@ timerfd_prepare(uint64_t period_microseconds)
 	int fd;
 	struct itimerspec new_value;
     struct timespec now;
+    uint64_t period_milliseconds = (period_microseconds + 999) / 1000;
 
 	if (period_microseconds == 0) {
 		return -EINVAL;
@@ -499,10 +482,10 @@ timerfd_prepare(uint64_t period_microseconds)
     int ret = clock_gettime(CLOCK_REALTIME, &now);
     assert(ret != -1);
 
-    new_value.it_value.tv_sec = period_microseconds * 1000;
-    new_value.it_value.tv_nsec = now.tv_nsec;
+    new_value.it_value.tv_sec = period_milliseconds * 1000;
+    new_value.it_value.tv_nsec = 0;
 
-    new_value.it_interval.tv_sec = period_microseconds * 1000;
+    new_value.it_interval.tv_sec = period_milliseconds * 1000;
     new_value.it_interval.tv_nsec = 0;
 
 	fd = timerfd_create(CLOCK_MONOTONIC, TFD_NONBLOCK );

@@ -710,6 +710,8 @@ void *spdk_io_channel_iter_get_ctx(struct spdk_io_channel_iter *i);
  */
 void spdk_for_each_channel_continue(struct spdk_io_channel_iter *i, int status);
 
+#include "spdk_internal/edriven_thread.h"
+
 #ifdef __cplusplus
 }
 #endif

@@ -96,6 +96,25 @@ spdk_reactor_get(uint32_t lcore)
 static int spdk_reactor_thread_op(struct spdk_thread *thread, enum spdk_thread_op op);
 static bool spdk_reactor_thread_op_supported(enum spdk_thread_op op);
 
+
+
+int spdk_reactor_event_callback(void *cb_arg);
+
+
+static int
+spdk_reactors_edriven_init(int num_lcores)
+{
+	struct spdk_reactor *reactor = spdk_reactor_get(num_lcores);
+	int i, rc;
+
+	for (i = 0; i < num_lcores; i++) {
+		rc = spdk_reactor_edriven_init(i, spdk_reactor_event_callback, reactor);
+		assert(rc == 0);
+	}
+
+	return 0;
+}
+
 int
 spdk_reactors_init(void)
 {
@@ -165,7 +184,7 @@ spdk_reactors_fini(void)
 	}
 
 	// CHANGE: edriven
-	int rc = spdk_reactors_edriven_fini(i);
+	int rc = spdk_reactors_edriven_fini(i, spdk_reactor_event_callback);
 	assert(rc == 0);
 
 	spdk_mempool_free(g_spdk_event_mempool);
@@ -329,6 +348,7 @@ static uint64_t g_rusage_period;
 
 // CHANGE: edriven
 /* callback function for reactor's origin eventfd which is used for reactor event queue */
+
 int
 spdk_reactor_event_callback(void *cb_arg)
 {
@@ -374,6 +394,23 @@ spdk_reactor_event_callback(void *cb_arg)
 	}
 
 	return count;
+}
+
+
+/* epoll_wait for reactor epfd, and call related callback_fn if any event occurs.
+ *
+ * called in _spdk_reactor_run as a replacement for reactor_run
+ * function reactor_run() should be split and replaced.
+ */
+static int
+spdk_reactor_edriven_main(struct spdk_reactor *reactor)
+{
+	struct reactor_edriven_ctx *reactor_ctx = spdk_reactor_edriven_get_ctx(reactor->lcore);
+	int block_timeout = -1; //_EPOLL_WAIT_FOREVER;
+
+	spdk_reactor_edriven_epoll_wait(reactor_ctx, block_timeout);
+
+	return 0;
 }
 
 static void
