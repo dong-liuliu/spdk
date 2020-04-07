@@ -217,7 +217,7 @@ spdk_event_call(struct spdk_event *event)
 
 	// CHANGE: edriven
 	rc = spdk_reactor_event_notify(event->lcore);
-	assert(rc = 0);
+	assert(rc == 0);
 }
 
 static inline uint32_t

@@ -45,6 +45,8 @@ extern "C" {
 #include "spdk/thread.h"
 #include "spdk/util.h"
 
+#include "spdk_internal/edriven.h"
+
 struct spdk_event {
 	uint32_t		lcore;
 	spdk_event_fn		fn;

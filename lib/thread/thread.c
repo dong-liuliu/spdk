@@ -42,6 +42,7 @@
 
 #include "spdk_internal/log.h"
 #include "spdk_internal/thread.h"
+#include "spdk_internal/edriven.h"
 
 #define SPDK_MSG_BATCH_SIZE		8
 #define SPDK_MAX_DEVICE_NAME_LEN	256
@@ -168,6 +169,39 @@ spdk_thread_lib_fini(void)
 	g_ctx_sz = 0;
 }
 
+
+
+// CHANGED: edriven
+extern int spdk_thread_msg_notify(struct spdk_thread *thread);
+extern int spdk_thread_msg_level_clear(struct spdk_thread *thread);
+extern struct spdk_edriven_event_source *spdk_thread_edriven_register(spdk_poller_fn fn, void *arg,
+		const char *name);
+
+/* register a timerfd to thread epfd.
+ * A replacement to spdk_poller_register(,,period_microseconds,);
+ */
+extern struct spdk_edriven_event_source *spdk_thread_edriven_interval_register(spdk_poller_fn fn, void *arg,
+	      uint64_t period_microseconds, const char *name);
+
+extern int spdk_thread_edriven_unregister(struct spdk_edriven_event_source **pesrc);
+extern int spdk_reactor_edriven_create_thread(struct spdk_thread *thread);
+
+extern int spdk_reactor_edriven_add_thread(uint32_t current_core, struct spdk_thread *thread);
+
+extern int spdk_reactor_edriven_remove_thread(uint32_t current_core, struct spdk_thread *thread);
+
+extern int spdk_reactor_edriven_destroy_thread(struct spdk_thread *thread);
+
+
+void
+spdk_thread_remove_edriven(struct spdk_thread *thread, struct spdk_edriven_event_source *event_src);
+void
+spdk_thread_insert_edriven(struct spdk_thread *thread, struct spdk_edriven_event_source *event_src);
+int
+spdk_reactor_edriven_thread_main(void *cb_arg);
+int
+spdk_thread_msg_queue_edriven(void *cb_arg);
+
 static void
 _free_thread(struct spdk_thread *thread)
 {
@@ -187,7 +221,7 @@ _free_thread(struct spdk_thread *thread)
 				     poller->name);
 //		}
 		TAILQ_REMOVE(&thread->active_pollers, poller, tailq);
-		spdk_thread_edriven_unregister(&poller);
+		spdk_thread_edriven_unregister((struct spdk_edriven_event_source **)&poller);
 		free(poller);
 	}
 
@@ -198,7 +232,7 @@ _free_thread(struct spdk_thread *thread)
 				     poller->name);
 //		}
 		TAILQ_REMOVE(&thread->timed_pollers, poller, tailq);
-		spdk_thread_edriven_unregister(&poller);
+		spdk_thread_edriven_unregister((struct spdk_edriven_event_source **)&poller);
 		free(poller);
 	}
 
@@ -207,7 +241,7 @@ _free_thread(struct spdk_thread *thread)
 		SPDK_WARNLOG("poller %s still registered at thread exit\n", poller->name);
 		TAILQ_REMOVE(&thread->paused_pollers, poller, tailq);
 
-		spdk_thread_edriven_unregister(&poller);
+		spdk_thread_edriven_unregister((struct spdk_edriven_event_source **)&poller);
 		free(poller);
 	}
 
@@ -539,14 +573,14 @@ _spdk_poller_insert_timer(struct spdk_thread *thread, struct spdk_poller *poller
 void
 spdk_thread_insert_edriven(struct spdk_thread *thread, struct spdk_edriven_event_source *event_src)
 {
-	struct spdk_poller *poller = event_src;
+	struct spdk_poller *poller = (struct spdk_poller *)event_src;
 	TAILQ_INSERT_TAIL(&thread->active_pollers, poller, tailq);
 }
 
 void
 spdk_thread_remove_edriven(struct spdk_thread *thread, struct spdk_edriven_event_source *event_src)
 {
-	struct spdk_poller *poller = event_src;
+	struct spdk_poller *poller = (struct spdk_poller *)event_src;
 	TAILQ_REMOVE(&thread->active_pollers, poller, tailq);
 }
 
@@ -582,10 +616,8 @@ spdk_thread_msg_queue_edriven(void *cb_arg)
 {
 	struct spdk_thread *thread = cb_arg;
 	struct spdk_thread *orig_thread;
-	int rc;
 	uint32_t msg_count;
 	spdk_msg_fn critical_msg;
-	struct spdk_poller *poller, *tmp;
 	int rc = 0;
 	uint64_t now = spdk_get_ticks();
 
@@ -609,6 +641,32 @@ spdk_thread_msg_queue_edriven(void *cb_arg)
 
 	return rc;
 }
+
+// CHANGED: edriven
+int
+spdk_reactor_edriven_thread_main(void *cb_arg)
+{
+	int nonblock_timeout = 0; // _EPOLL_NOWAIT;
+	struct reactor_edriven_ctx *thd_ectx = cb_arg;
+
+	struct spdk_lw_thread *lw_thread = cb_arg;
+	struct spdk_thread *thread = spdk_thread_get_from_ctx(lw_thread);
+	struct spdk_thread *orig_thread;
+	int rc = 0;
+	uint64_t now = spdk_get_ticks();
+
+	orig_thread = _get_thread();
+	tls_thread = thread;
+
+	rc = spdk_reactor_edriven_epoll_wait(thd_ectx, nonblock_timeout);
+
+	_spdk_thread_update_stats(thread, now, rc);
+
+	tls_thread = orig_thread;
+
+	return rc;
+}
+
 
 static int
 _spdk_thread_poll(struct spdk_thread *thread, uint32_t max_msgs, uint64_t now)
@@ -904,7 +962,7 @@ spdk_thread_send_msg(const struct spdk_thread *thread, spdk_msg_fn fn, void *ctx
 	}
 
 	// CHANGE: edriven
-	rc = spdk_thread_msg_notify(thread);
+	rc = spdk_thread_msg_notify((struct spdk_thread *)thread);
 
 	return 0;
 }
@@ -996,57 +1054,6 @@ spdk_poller_register_named(spdk_poller_fn fn,
 	return _spdk_poller_register(fn, arg, period_microseconds, name);
 }
 
-
-int
-spdk_edriven_interval_register(spdk_poller_fn fn,
-	      void *arg,
-	      uint64_t period_microseconds,
-	      const char *name)
-{
-	struct spdk_thread *thread;
-	int rc;
-
-	thread = spdk_get_thread();
-	if (!thread) {
-		assert(false);
-		return NULL;
-	}
-
-	if (spdk_unlikely(thread->exit)) {
-		SPDK_ERRLOG("thread %s is marked as exited\n", thread->name);
-		return NULL;
-	}
-
-	rc = spdk_thread_edriven_interval_register(thread, fn, arg, period_microseconds, name);
-	assert(rc == 0);
-
-	return rc;
-}
-
-int
-spdk_edriven_event_register(spdk_poller_fn fn,
-	      void *arg,
-	      const char *name)
-{
-	struct spdk_thread *thread;
-	int rc;
-
-	thread = spdk_get_thread();
-	if (!thread) {
-		assert(false);
-		return NULL;
-	}
-
-	if (spdk_unlikely(thread->exit)) {
-		SPDK_ERRLOG("thread %s is marked as exited\n", thread->name);
-		return NULL;
-	}
-
-	rc = spdk_thread_edriven_event_register(thread, fn, arg, name);
-	assert(rc == 0);
-
-	return rc;
-}
 
 void
 spdk_poller_unregister(struct spdk_poller **ppoller)
