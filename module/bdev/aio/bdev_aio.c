@@ -49,6 +49,8 @@
 
 #include "spdk_internal/log.h"
 
+#include "spdk_internal/edriven.h"
+
 #include <libaio.h>
 
 struct bdev_aio_io_channel {
@@ -162,11 +164,15 @@ bdev_aio_close(struct file_disk *disk)
 }
 
 // CHANGE: edriven
-static inline bdev_aio_request_edriven(struct iocb *iocb, struct bdev_aio_io_channel *aio_ch)
+static inline int
+bdev_aio_request_edriven(struct iocb *iocb, struct bdev_aio_io_channel *aio_ch)
 {
 	int aio_efd = spdk_edriven_source_get_efd(spdk_poller_to_edriven_source(aio_ch->group_ch->poller));
+	assert(aio_efd > 0);
 
 	io_set_eventfd(iocb, aio_efd);
+
+	return 0;
 }
 
 static int64_t
@@ -583,7 +589,7 @@ bdev_aio_group_create_cb(void *io_device, void *ctx_buf)
 	}
 
 	//ch->poller = spdk_poller_register(bdev_aio_group_poll, ch, 0);
-	ch->poller = spdk_thread_edriven_register(bdev_aio_group_poll, ch, NULL);
+	ch->poller = (struct spdk_poller *)spdk_thread_edriven_register(bdev_aio_group_poll, ch, NULL);
 
 	return 0;
 }
@@ -596,7 +602,7 @@ bdev_aio_group_destroy_cb(void *io_device, void *ctx_buf)
 
 	io_destroy(ch->io_ctx);
 
-	spdk_thread_edriven_unregister(&spdk_poller_to_edriven_source(ch->poller));
+	spdk_thread_edriven_unregister((struct spdk_edriven_event_source **)&ch->poller);
 	//spdk_poller_unregister(&ch->poller);
 }
 

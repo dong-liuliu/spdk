@@ -104,10 +104,10 @@ int spdk_reactor_event_callback(void *cb_arg);
 static int
 spdk_reactors_edriven_init(int num_lcores)
 {
-	struct spdk_reactor *reactor = spdk_reactor_get(num_lcores);
 	int i, rc;
 
 	for (i = 0; i < num_lcores; i++) {
+		struct spdk_reactor *reactor = spdk_reactor_get(i);
 		rc = spdk_reactor_edriven_init(i, spdk_reactor_event_callback, reactor);
 		assert(rc == 0);
 	}
@@ -155,7 +155,7 @@ spdk_reactors_init(void)
 	}
 
 	// CHANGE: edriven
-	rc = spdk_reactors_edriven_init(last_core);
+	rc = spdk_reactors_edriven_init(last_core + 1);
 	assert(rc == 0);
 
 	g_reactor_state = SPDK_REACTOR_STATE_INITIALIZED;

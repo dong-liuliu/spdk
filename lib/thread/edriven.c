@@ -103,7 +103,7 @@ spdk_reactor_edriven_init(int lcore_idx, reactor_edriven_callback_fn cb, void *c
 	assert(reactor_ectx->epfd);
 
 	rc = edriven_ctx_add_eventfd(reactor_ectx, cb, cb_arg);
-	assert(rc);
+	assert(rc == 0);
 
 	return rc;
 }
@@ -161,7 +161,7 @@ spdk_reactor_edriven_epoll_wait(void *edriven_ctx, int timeout)
 {
 	struct reactor_edriven_ctx *ectx = edriven_ctx;
 	struct epoll_event *events;
-	int totalfds = 0;
+	int totalfds = ectx->num_fds;
 	int nfds;
 
 	/* dynamically allocate events */
@@ -173,9 +173,10 @@ spdk_reactor_edriven_epoll_wait(void *edriven_ctx, int timeout)
 //		memset(events, 0, totalfds * sizeof(struct epoll_event));
 //	}
 	events = calloc(1, totalfds * sizeof(struct epoll_event));
+	assert(events);
 
 	/* epfd of thread ectx should not be blocked */
-	nfds = epoll_wait(ectx->epfd, events, totalfds, 0);
+	nfds = epoll_wait(ectx->epfd, events, totalfds, timeout);
 	if (nfds < 0) {
 		if (errno == EINTR)
 			return -errno;
@@ -340,7 +341,7 @@ spdk_reactor_edriven_create_thread(struct spdk_thread *thread)
 
 	/* register efd for msg queue to thread epfd */
 	rc = edriven_ctx_add_eventfd(thd_ectx, spdk_thread_msg_queue_edriven, thread);
-	assert(rc);
+	assert(rc == 0);
 
 	return rc;
 }
@@ -359,7 +360,7 @@ spdk_reactor_edriven_add_thread(uint32_t current_core, struct spdk_thread *threa
 
 	thread_event_src = edriven_callback_register(reactor_ectx, efd, epevent_flag,
 			spdk_reactor_edriven_thread_main, thd_ectx, NULL);
-	assert(thread_event_src == 0);
+	assert(thread_event_src != 0);
 
 	thread->thd_event_src = thread_event_src;
 
