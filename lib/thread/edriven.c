@@ -45,6 +45,7 @@ struct spdk_edriven_event_source {
 	struct reactor_edriven_cb_list callbacks;  /**< user callbacks */
 	int fd;	 /**< interrupt event file descriptor */
 	int epevent_flag;
+	bool timer;
 	//uint32_t active;
 };
 
@@ -146,6 +147,15 @@ _reactor_edriven_process(struct epoll_event *events, int nfds)
 	for (n = 0; n < nfds; n++) {
 		/* find the edriven_source */
 		event_src = events->data.ptr;
+
+		/* clear the edge of interval timer */
+		if (event_src->timer) {
+			uint64_t exp;
+			int rc;
+
+			rc = read(event_src->fd, &exp, sizeof(exp));
+			assert(rc == sizeof(exp));
+		}
 
 		/* call the edriven callbacks */
 		TAILQ_FOREACH(callback, &event_src->callbacks, next) {
@@ -474,7 +484,8 @@ timerfd_prepare(uint64_t period_microseconds)
 	int fd;
 	struct itimerspec new_value;
     struct timespec now;
-    uint64_t period_milliseconds = (period_microseconds + 999) / 1000;
+    uint64_t period_seconds = (period_microseconds) / 1000 / 1000;
+    uint64_t period_nanoseconds = period_microseconds * 1000;
 
 	if (period_microseconds == 0) {
 		return -EINVAL;
@@ -483,13 +494,13 @@ timerfd_prepare(uint64_t period_microseconds)
     int ret = clock_gettime(CLOCK_REALTIME, &now);
     assert(ret != -1);
 
-    new_value.it_value.tv_sec = period_milliseconds * 1000;
-    new_value.it_value.tv_nsec = 0;
+    new_value.it_value.tv_sec = period_seconds;
+    new_value.it_value.tv_nsec = period_nanoseconds;
 
-    new_value.it_interval.tv_sec = period_milliseconds * 1000;
-    new_value.it_interval.tv_nsec = 0;
+    new_value.it_interval.tv_sec = period_seconds;
+    new_value.it_interval.tv_nsec = period_nanoseconds;
 
-	fd = timerfd_create(CLOCK_MONOTONIC, TFD_NONBLOCK );
+	fd = timerfd_create(CLOCK_MONOTONIC, TFD_NONBLOCK);
 	assert(fd != -1);
 
 	ret = timerfd_settime(fd, 0, &new_value, NULL);
@@ -524,6 +535,7 @@ spdk_thread_edriven_interval_register(spdk_poller_fn fn, void *arg,
 
 	event_src = edriven_callback_register(thread->thd_ectx, efd, epevent_flag, fn, arg, NULL);
 	assert(event_src != NULL);
+	event_src->timer = true;
 
 	spdk_thread_insert_edriven(thread, event_src);
 
