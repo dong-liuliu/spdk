@@ -623,11 +623,9 @@ int
 spdk_reactor_edriven_thread_main(void *cb_arg)
 {
 	int nonblock_timeout = 0; // _EPOLL_NOWAIT;
-	struct reactor_edriven_ctx *thd_ectx = cb_arg;
-
-	struct spdk_lw_thread *lw_thread = cb_arg;
-	struct spdk_thread *thread = spdk_thread_get_from_ctx(lw_thread);
+	struct spdk_thread *thread = cb_arg;
 	struct spdk_thread *orig_thread;
+	struct reactor_edriven_ctx *thd_ectx = thread->thd_ectx;
 	int rc = 0;
 	uint64_t now = spdk_get_ticks();
 

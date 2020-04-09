@@ -46,6 +46,7 @@ struct spdk_edriven_event_source {
 	int fd;	 /**< interrupt event file descriptor */
 	int epevent_flag;
 	bool timer;
+	bool keepfd;
 	//uint32_t active;
 };
 
@@ -146,7 +147,7 @@ _reactor_edriven_process(struct epoll_event *events, int nfds)
 
 	for (n = 0; n < nfds; n++) {
 		/* find the edriven_source */
-		event_src = events->data.ptr;
+		event_src = events[n].data.ptr;
 
 		/* clear the edge of interval timer */
 		if (event_src->timer) {
@@ -154,12 +155,18 @@ _reactor_edriven_process(struct epoll_event *events, int nfds)
 			int rc;
 
 			rc = read(event_src->fd, &exp, sizeof(exp));
-			assert(rc == sizeof(exp));
+			//assert(rc == sizeof(exp));
+			if (rc != sizeof(exp)) {
+				SPDK_ERRLOG("edriven: timer read error");
+			}
 		}
 
 		/* call the edriven callbacks */
 		TAILQ_FOREACH(callback, &event_src->callbacks, next) {
+			//SPDK_ERRLOG("event_src %p, callback %p\n", event_src, callback);
 			callback->cb_fn(callback->cb_arg);
+
+			break;
 		}
 	}
 
@@ -304,6 +311,7 @@ edriven_callback_unregister(struct reactor_edriven_ctx *ectx,
 		assert(rc==0);
 
 		TAILQ_REMOVE(&ectx->edriven_sources, event_src, next);
+
 		free(event_src);
 	}
 
@@ -369,7 +377,7 @@ spdk_reactor_edriven_add_thread(uint32_t current_core, struct spdk_thread *threa
 	int efd = thd_ectx->epfd;
 
 	thread_event_src = edriven_callback_register(reactor_ectx, efd, epevent_flag,
-			spdk_reactor_edriven_thread_main, thd_ectx, NULL);
+			spdk_reactor_edriven_thread_main, thread, NULL);
 	assert(thread_event_src != 0);
 
 	thread->thd_event_src = thread_event_src;
@@ -443,6 +451,63 @@ spdk_thread_edriven_register(spdk_poller_fn fn,
 	return event_src;
 }
 
+// nbd->spdk_sp_fd is for both datain and dataout
+int
+spdk_thread_edriven_nbd_change_type(struct spdk_edriven_event_source *event_src, bool edge)
+{
+	int rc;
+	struct epoll_event epevent;
+	int epevent_flag = EPOLLIN | EPOLLOUT;
+	struct spdk_thread *thread;
+
+	thread = spdk_get_thread();
+
+
+	if (edge) {
+		epevent_flag |= EPOLLET;
+	}
+
+	epevent.events = epevent_flag;
+	epevent.data.ptr = event_src;
+	event_src->epevent_flag = epevent_flag;
+
+	rc = epoll_ctl(thread->thd_ectx->epfd, EPOLL_CTL_MOD, event_src->fd, &epevent);
+	assert(rc == 0);
+
+	return rc;
+}
+
+struct spdk_edriven_event_source *
+spdk_thread_edriven_register_nbd(spdk_poller_fn fn,
+		     void *arg, const char *name, int datafd)
+{
+	struct spdk_edriven_event_source *event_src;
+	//int rc = 0;
+	int epevent_flag = EPOLLIN | EPOLLOUT | EPOLLET;
+	struct spdk_thread *thread;
+
+	thread = spdk_get_thread();
+	if (!thread) {
+		assert(false);
+		return NULL;
+	}
+
+	if (spdk_unlikely(thread->exit)) {
+		SPDK_ERRLOG("thread %s is marked as exited\n", thread->name);
+		return NULL;
+	}
+
+	assert(datafd > 0);
+	event_src = edriven_callback_register(thread->thd_ectx, datafd, epevent_flag, fn, arg, NULL);
+	assert(event_src != NULL);
+
+	event_src->keepfd = true;
+
+	spdk_thread_insert_edriven(thread, event_src);
+
+	return event_src;
+}
+
 int spdk_thread_edriven_unregister(struct spdk_edriven_event_source **pesrc)
 {
 		struct spdk_thread *thread;
@@ -467,10 +532,13 @@ int spdk_thread_edriven_unregister(struct spdk_edriven_event_source **pesrc)
 		spdk_thread_remove_edriven(thread, esrc);
 
 		efd = esrc->fd;
+		bool keepfd = esrc->keepfd;
 		rc = edriven_callback_unregister(thread->thd_ectx, esrc, NULL);
 		assert(rc == 0);
 
-		close(efd);
+		if (!keepfd) {
+			close(efd);
+		}
 
 		return rc;
 }

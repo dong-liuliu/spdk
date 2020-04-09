@@ -54,7 +54,7 @@ SPDK_LIB_LIST += event log trace conf thread util bdev accel rpc jsonrpc json so
 SPDK_LIB_LIST += app_rpc log_rpc bdev_rpc notify
 
 ifeq ($(OS),Linux)
-#SPDK_LIB_LIST += event_nbd nbd
+SPDK_LIB_LIST += event_nbd nbd
 endif
 
 ifeq ($(CONFIG_FC),y)

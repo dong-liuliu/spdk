@@ -62,6 +62,7 @@ int spdk_edriven_source_get_efd(struct spdk_edriven_event_source *esrc);
  *
  * A replacement to spdk_poller_register in bdev_aio, can achieved by set fn to be bdev_aio_group_poll
  */
+// used for aio
 struct spdk_edriven_event_source *spdk_thread_edriven_register(spdk_poller_fn fn, void *arg,
 		const char *name);
 
@@ -70,6 +71,14 @@ struct spdk_edriven_event_source *spdk_thread_edriven_register(spdk_poller_fn fn
  */
 struct spdk_edriven_event_source *spdk_thread_edriven_interval_register(spdk_poller_fn fn, void *arg,
 	      uint64_t period_microseconds, const char *name);
+
+// used for nbd
+struct spdk_edriven_event_source *
+spdk_thread_edriven_register_nbd(spdk_poller_fn fn,
+		     void *arg, const char *name, int datafd);
+
+int
+spdk_thread_edriven_nbd_change_type(struct spdk_edriven_event_source *event_src, bool edge);
 
 int spdk_thread_edriven_unregister(struct spdk_edriven_event_source **pesrc);
 

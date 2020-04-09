@@ -355,6 +355,10 @@ _nbd_stop(struct spdk_nbd_disk *nbd)
 		spdk_bdev_close(nbd->bdev_desc);
 	}
 
+	if (nbd->nbd_poller) {
+		spdk_thread_edriven_unregister((struct spdk_edriven_event_source **)&nbd->nbd_poller);
+	}
+
 	if (nbd->spdk_sp_fd >= 0) {
 		close(nbd->spdk_sp_fd);
 	}
@@ -374,10 +378,6 @@ _nbd_stop(struct spdk_nbd_disk *nbd)
 
 	if (nbd->nbd_path) {
 		free(nbd->nbd_path);
-	}
-
-	if (nbd->nbd_poller) {
-		spdk_poller_unregister(&nbd->nbd_poller);
 	}
 
 	spdk_nbd_disk_unregister(nbd);
@@ -451,6 +451,13 @@ nbd_io_done(struct spdk_bdev_io *bdev_io, bool success, void *cb_arg)
 	}
 
 	memcpy(&io->resp.handle, &io->req.handle, sizeof(io->resp.handle));
+
+	if (TAILQ_EMPTY(&nbd->executed_io_list)) {
+
+		SPDK_ERRLOG("chagne type to level\n");
+		spdk_thread_edriven_nbd_change_type((struct spdk_edriven_event_source *)nbd->nbd_poller, false);
+	}
+
 	TAILQ_INSERT_TAIL(&nbd->executed_io_list, io, tailq);
 
 	if (bdev_io != NULL) {
@@ -767,6 +774,12 @@ spdk_nbd_io_xmit(struct spdk_nbd_disk *nbd)
 		if (ret != 0) {
 			return ret;
 		}
+
+		if (TAILQ_EMPTY(&nbd->executed_io_list)) {
+
+			SPDK_ERRLOG("chagne type to edge\n");
+			spdk_thread_edriven_nbd_change_type((struct spdk_edriven_event_source *)nbd->nbd_poller, true);
+		}
 	}
 
 	/*
@@ -776,6 +789,7 @@ spdk_nbd_io_xmit(struct spdk_nbd_disk *nbd)
 	if (nbd->state == NBD_DISK_STATE_SOFTDISC && !spdk_nbd_io_xmit_check(nbd)) {
 		return -1;
 	}
+
 
 	return 0;
 }
@@ -791,6 +805,7 @@ _spdk_nbd_poll(struct spdk_nbd_disk *nbd)
 	int rc;
 
 	/* transmit executed io first */
+	// CHANGED: edriven: requires a way to trigger xmit
 	rc = spdk_nbd_io_xmit(nbd);
 	if (rc < 0) {
 		return rc;
@@ -911,7 +926,8 @@ spdk_nbd_start_complete(struct spdk_nbd_start_ctx *ctx)
 		goto err;
 	}
 
-	ctx->nbd->nbd_poller = spdk_poller_register(spdk_nbd_poll, ctx->nbd, 0);
+	//ctx->nbd->nbd_poller = spdk_poller_register(spdk_nbd_poll, ctx->nbd, 0);
+	ctx->nbd->nbd_poller = (struct spdk_poller *)spdk_thread_edriven_register_nbd(spdk_nbd_poll, ctx->nbd, NULL, ctx->nbd->spdk_sp_fd);
 
 	if (ctx->cb_fn) {
 		ctx->cb_fn(ctx->cb_arg, ctx->nbd, 0);
@@ -939,8 +955,10 @@ spdk_nbd_enable_kernel(void *arg)
 	if (rc == -1) {
 		if (errno == EBUSY && ctx->polling_count-- > 0) {
 			if (ctx->poller == NULL) {
-				ctx->poller = spdk_poller_register(spdk_nbd_enable_kernel, ctx,
-								   NBD_BUSY_POLLING_INTERVAL_US);
+				//ctx->poller = spdk_poller_register(spdk_nbd_enable_kernel, ctx,
+				//				   NBD_BUSY_POLLING_INTERVAL_US);
+				ctx->poller = (struct spdk_poller *)spdk_thread_edriven_interval_register(spdk_nbd_enable_kernel, ctx,
+												   NBD_BUSY_POLLING_INTERVAL_US, NULL);
 			}
 			/* If the kernel is busy, check back later */
 			return 0;
@@ -948,7 +966,7 @@ spdk_nbd_enable_kernel(void *arg)
 
 		SPDK_ERRLOG("ioctl(NBD_SET_SOCK) failed: %s\n", spdk_strerror(errno));
 		if (ctx->poller) {
-			spdk_poller_unregister(&ctx->poller);
+			spdk_thread_edriven_unregister((struct spdk_edriven_event_source **)&ctx->poller);
 		}
 
 		spdk_nbd_stop(ctx->nbd);
@@ -962,7 +980,7 @@ spdk_nbd_enable_kernel(void *arg)
 	}
 
 	if (ctx->poller) {
-		spdk_poller_unregister(&ctx->poller);
+		spdk_thread_edriven_unregister((struct spdk_edriven_event_source **)&ctx->poller);
 	}
 
 	spdk_nbd_start_complete(ctx);
