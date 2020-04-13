@@ -44,6 +44,7 @@
 #include "vhost_internal.h"
 #include "spdk/bdev.h"
 
+/*
 struct rpc_vhost_scsi_ctrlr {
 	char *ctrlr;
 	char *cpumask;
@@ -236,7 +237,7 @@ invalid:
 SPDK_RPC_REGISTER("vhost_scsi_controller_remove_target",
 		  spdk_rpc_vhost_scsi_controller_remove_target, SPDK_RPC_RUNTIME)
 SPDK_RPC_REGISTER_ALIAS_DEPRECATED(vhost_scsi_controller_remove_target, remove_vhost_scsi_target)
-
+*/
 struct rpc_vhost_blk_ctrlr {
 	char *ctrlr;
 	char *dev_name;

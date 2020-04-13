@@ -432,6 +432,14 @@ vhost_vq_used_ring_enqueue(struct spdk_vhost_session *vsession,
 	rte_vhost_clr_inflight_desc_split(vsession->vid, vq_idx, virtqueue->last_used_idx, id);
 
 	virtqueue->used_req_cnt++;
+
+	// CHANGED: edriven
+	if (virtqueue->vring.desc == NULL ||
+		    (virtqueue->vring.avail->flags & VRING_AVAIL_F_NO_INTERRUPT)) {
+			return;
+		}
+
+	vhost_vq_used_signal(vsession, virtqueue);
 }
 
 int
@@ -966,7 +974,7 @@ vhost_start_device_cb(int vid)
 		}
 
 		/* Disable I/O submission notifications, we'll be polling. */
-		q->vring.used->flags = VRING_USED_F_NO_NOTIFY;
+		//q->vring.used->flags = VRING_USED_F_NO_NOTIFY;
 		vsession->max_queues = i + 1;
 	}
 
@@ -1232,11 +1240,11 @@ spdk_vhost_init(spdk_vhost_init_cb init_cb)
 		goto out;
 	}
 
-	ret = vhost_scsi_controller_construct();
-	if (ret != 0) {
-		SPDK_ERRLOG("Cannot construct vhost controllers\n");
-		goto out;
-	}
+//	ret = vhost_scsi_controller_construct();
+//	if (ret != 0) {
+//		SPDK_ERRLOG("Cannot construct vhost controllers\n");
+//		goto out;
+//	}
 
 	ret = vhost_blk_controller_construct();
 	if (ret != 0) {

@@ -70,4 +70,4 @@ static struct spdk_subsystem g_spdk_subsystem_vhost = {
 };
 
 SPDK_SUBSYSTEM_REGISTER(g_spdk_subsystem_vhost);
-SPDK_SUBSYSTEM_DEPEND(vhost, scsi)
+//SPDK_SUBSYSTEM_DEPEND(vhost, scsi)

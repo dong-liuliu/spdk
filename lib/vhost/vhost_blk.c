@@ -106,6 +106,13 @@ struct spdk_vhost_blk_session {
 /* forward declaration */
 static const struct spdk_vhost_dev_backend vhost_blk_device_backend;
 
+
+
+static int
+vhost_session_unregister_vqs_kick_blk(struct spdk_vhost_session *vsession);
+static struct spdk_poller *
+vhost_session_register_vqs_kick_blk(struct spdk_vhost_session *vsession, bool has_bdev);
+
 static int
 process_blk_request(struct spdk_vhost_blk_task *task,
 		    struct spdk_vhost_blk_session *bvsession,
@@ -603,12 +610,35 @@ no_bdev_vdev_worker(void *arg)
 		no_bdev_process_vq(bvsession, &vsession->virtqueue[q_idx]);
 	}
 
+	// TODO: edriven
+
 	vhost_session_used_signal(vsession);
 
 	if (vsession->task_cnt == 0 && bvsession->io_channel) {
 		spdk_put_io_channel(bvsession->io_channel);
 		bvsession->io_channel = NULL;
 	}
+
+	return -1;
+}
+
+// TODO: edriven
+static int
+vdev_vq_worker(void *arg)
+{
+	struct spdk_vhost_blk_kick_ctx *ctx = arg;
+
+	process_vq(ctx->bvsession, ctx->vq);
+
+	return -1;
+}
+
+static int
+no_bdev_vdev_vq_worker(void *arg)
+{
+	struct spdk_vhost_blk_kick_ctx *ctx = arg;
+
+	no_bdev_process_vq(ctx->bvsession, ctx->vq);
 
 	return -1;
 }
@@ -665,9 +695,13 @@ vhost_session_bdev_remove_cb(struct spdk_vhost_dev *vdev,
 	struct spdk_vhost_blk_session *bvsession;
 
 	bvsession = (struct spdk_vhost_blk_session *)vsession;
+
+	// TODO: edriven
 	if (bvsession->requestq_poller) {
-		spdk_poller_unregister(&bvsession->requestq_poller);
-		bvsession->requestq_poller = spdk_poller_register(no_bdev_vdev_worker, bvsession, 0);
+//		spdk_poller_unregister(&bvsession->requestq_poller);
+//		bvsession->requestq_poller = spdk_poller_register(no_bdev_vdev_worker, bvsession, 0);
+		vhost_session_unregister_vqs_kick_blk(vsession);
+		bvsession->requestq_poller = vhost_session_register_vqs_kick_blk(vsession, false);
 	}
 
 	return 0;
@@ -750,6 +784,55 @@ alloc_task_pool(struct spdk_vhost_blk_session *bvsession)
 	return 0;
 }
 
+
+static struct spdk_poller *
+vhost_session_register_vqs_kick_blk(struct spdk_vhost_session *vsession, bool has_bdev)
+{
+	struct spdk_vhost_blk_session *bvsession = to_blk_session(vsession);
+	struct spdk_vhost_virtqueue *vq;
+	int i;
+
+	SPDK_DEBUGLOG(SPDK_LOG_VHOST_RING, "Register virtqueues interrupt\n");
+	for (i = 0; i < vsession->max_queues; i++) {
+		vq = &vsession->virtqueue[i];
+		SPDK_ERRLOG("Register vq[%d]'s kickfd is %d\n",
+			      i, vq->vring.kickfd);
+
+		vq->kick_ctx.bvsession = bvsession;
+		vq->kick_ctx.vq = vq;
+//		vq->kick_ctx.vq_poller = (struct spdk_poller *)spdk_thread_edriven_interval_register(has_bdev ? vdev_vq_worker : no_bdev_vdev_vq_worker,
+//				&vq->kick_ctx, 1000, NULL);
+		vq->kick_ctx.vq_poller = (struct spdk_poller *)spdk_thread_edriven_register_vring(has_bdev ? vdev_vq_worker : no_bdev_vdev_vq_worker,
+				&vq->kick_ctx, NULL, vq->vring.kickfd);
+
+		assert(vq->kick_ctx.vq_poller);
+		if (vq->kick_ctx.vq_poller == NULL) {
+			SPDK_ERRLOG("Fail to register req notifier handler.\n");
+			return NULL;
+		}
+	}
+
+	return vq->kick_ctx.vq_poller;
+}
+
+static int
+vhost_session_unregister_vqs_kick_blk(struct spdk_vhost_session *vsession)
+{
+	struct spdk_vhost_virtqueue *vq;
+	int i;
+
+	SPDK_DEBUGLOG(SPDK_LOG_VHOST_RING, "unregister virtqueues interrupt\n");
+	for (i = 0; i < vsession->max_queues; i++) {
+		vq = &vsession->virtqueue[i];
+		SPDK_ERRLOG("unregister vq[%d]'s kickfd is %d\n",
+			      i, vq->vring.kickfd);
+
+		spdk_thread_edriven_unregister((struct spdk_edriven_event_source **)&vq->kick_ctx.vq_poller);
+	}
+
+	return 0;
+}
+
 static int
 vhost_blk_start_cb(struct spdk_vhost_dev *vdev,
 		   struct spdk_vhost_session *vsession, void *unused)
@@ -787,8 +870,10 @@ vhost_blk_start_cb(struct spdk_vhost_dev *vdev,
 		}
 	}
 
-	bvsession->requestq_poller = spdk_poller_register(bvdev->bdev ? vdev_worker : no_bdev_vdev_worker,
-				     bvsession, 0);
+	//bvsession->requestq_poller = spdk_poller_register(bvdev->bdev ? vdev_worker : no_bdev_vdev_worker,
+	//			     bvsession, 0);
+	bvsession->requestq_poller = vhost_session_register_vqs_kick_blk(vsession, true);
+
 	SPDK_INFOLOG(SPDK_LOG_VHOST, "%s: started poller on lcore %d\n",
 		     vsession->name, spdk_env_get_current_core());
 out:
@@ -832,7 +917,8 @@ destroy_session_poller_cb(void *arg)
 	}
 
 	free_task_pool(bvsession);
-	spdk_poller_unregister(&bvsession->stop_poller);
+//	spdk_poller_unregister(&bvsession->stop_poller);
+	spdk_thread_edriven_unregister((struct spdk_edriven_event_source **)&bvsession->stop_poller);
 	vhost_session_stop_done(vsession, 0);
 
 	spdk_vhost_unlock();
@@ -845,9 +931,18 @@ vhost_blk_stop_cb(struct spdk_vhost_dev *vdev,
 {
 	struct spdk_vhost_blk_session *bvsession = to_blk_session(vsession);
 
-	spdk_poller_unregister(&bvsession->requestq_poller);
-	bvsession->stop_poller = spdk_poller_register(destroy_session_poller_cb,
-				 bvsession, 1000);
+
+	// TODO: edriven
+//	spdk_poller_unregister(&bvsession->requestq_poller);
+	vhost_session_unregister_vqs_kick_blk(vsession);
+
+//	bvsession->stop_poller = spdk_poller_register(destroy_session_poller_cb,
+//				 bvsession, 1000);
+
+	bvsession->stop_poller = (struct spdk_poller *)spdk_thread_edriven_interval_register(destroy_session_poller_cb,
+				 bvsession, 5000, NULL); //1000, NULL);
+	assert(bvsession->stop_poller);
+
 	return 0;
 }
 

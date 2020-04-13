@@ -57,6 +57,8 @@ ifeq ($(OS),Linux)
 SPDK_LIB_LIST += event_nbd nbd
 endif
 
+SPDK_LIB_LIST += vhost event_vhost
+
 ifeq ($(CONFIG_FC),y)
 ifneq ($(strip $(CONFIG_FC_PATH)),)
 SYS_LIBS += -L$(CONFIG_FC_PATH)
