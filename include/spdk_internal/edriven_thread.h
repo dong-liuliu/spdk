@@ -77,6 +77,10 @@ struct spdk_edriven_event_source *
 spdk_thread_edriven_register_nbd(spdk_poller_fn fn,
 		     void *arg, const char *name, int datafd);
 
+struct spdk_edriven_event_source *
+spdk_thread_edriven_register_vring(spdk_poller_fn fn,
+		     void *arg, const char *name, int vring_efd);
+
 int
 spdk_thread_edriven_nbd_change_type(struct spdk_edriven_event_source *event_src, bool edge);
 

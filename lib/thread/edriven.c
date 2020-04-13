@@ -46,6 +46,7 @@ struct spdk_edriven_event_source {
 	int fd;	 /**< interrupt event file descriptor */
 	int epevent_flag;
 	bool timer;
+	bool clear_edge;
 	bool keepfd;
 	//uint32_t active;
 };
@@ -161,6 +162,19 @@ _reactor_edriven_process(struct epoll_event *events, int nfds)
 			}
 		}
 
+		// clear
+		if (event_src->clear_edge) {
+			uint64_t exp;
+			int rc;
+
+			rc = read(event_src->fd, &exp, sizeof(exp));
+			//assert(rc == sizeof(exp));
+			if (rc != sizeof(exp)) {
+				SPDK_ERRLOG("edriven: timer read error");
+			}
+		}
+
+
 		/* call the edriven callbacks */
 		TAILQ_FOREACH(callback, &event_src->callbacks, next) {
 			//SPDK_ERRLOG("event_src %p, callback %p\n", event_src, callback);
@@ -222,6 +236,7 @@ edriven_callback_register(struct reactor_edriven_ctx *ectx, int efd, int epevent
 	struct epoll_event epevent;
 	int rc;
 
+	SPDK_ERRLOG("edriven register efd %d\n", efd);
 	/* first do parameter checking */
 	if (ectx == NULL || efd < 0 || fn == NULL) {
 		errno = EINVAL;
@@ -288,6 +303,7 @@ edriven_callback_unregister(struct reactor_edriven_ctx *ectx,
 	struct reactor_edriven_callback *cb, *next;
 	int ret = -1;
 
+	SPDK_ERRLOG("unregistering efd %d\n", event_src->fd);
 	if (ectx == NULL || event_src == NULL || event_src->fd <=0) {
 		SPDK_ERRLOG("Unregistering with invalid input parameter\n");
 		return -EINVAL;
@@ -502,6 +518,40 @@ spdk_thread_edriven_register_nbd(spdk_poller_fn fn,
 	assert(event_src != NULL);
 
 	event_src->keepfd = true;
+
+	spdk_thread_insert_edriven(thread, event_src);
+
+	return event_src;
+}
+
+struct spdk_edriven_event_source *
+spdk_thread_edriven_register_vring(spdk_poller_fn fn,
+		     void *arg, const char *name, int vring_efd)
+{
+	struct spdk_edriven_event_source *event_src;
+	//int rc = 0;
+	int epevent_flag = EPOLLIN;
+	struct spdk_thread *thread;
+
+	thread = spdk_get_thread();
+	if (!thread) {
+		assert(false);
+		return NULL;
+	}
+
+	if (spdk_unlikely(thread->exit)) {
+		SPDK_ERRLOG("thread %s is marked as exited\n", thread->name);
+		return NULL;
+	}
+
+	assert(vring_efd > 0);
+	event_src = edriven_callback_register(thread->thd_ectx, vring_efd, epevent_flag, fn, arg, NULL);
+	assert(event_src != NULL);
+
+	event_src->keepfd = true;
+
+	//TODO: for vring kicfd, it also requires read-out to clear the edage.
+	event_src->clear_edge = true;
 
 	spdk_thread_insert_edriven(thread, event_src);
 
