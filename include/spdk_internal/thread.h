@@ -37,6 +37,8 @@
 #include "spdk/stdinc.h"
 #include "spdk/thread.h"
 
+#include "spdk_internal/edriven.h"
+
 #define SPDK_MAX_POLLER_NAME_LEN	256
 #define SPDK_MAX_THREAD_NAME_LEN	256
 
@@ -108,6 +110,11 @@ struct spdk_thread {
 	SLIST_HEAD(, spdk_msg)		msg_cache;
 	size_t				msg_cache_count;
 	spdk_msg_fn			critical_msg;
+
+	bool				edriven;
+	struct spdk_edriven_group	*thd_egrp;
+	struct spdk_edriven_esrc	*thd_esrc;
+
 	/* User context allocated at the end */
 	uint8_t				ctx[0];
 };
@@ -115,5 +122,9 @@ struct spdk_thread {
 const char *spdk_poller_state_str(enum spdk_poller_state state);
 
 const char *spdk_io_device_get_name(struct io_device *dev);
+
+// used by edriven.c
+int spdk_edriven_thread_main(void *cb_arg);
+int spdk_thread_msg_queue_edriven(void *cb_arg);
 
 #endif /* SPDK_THREAD_INTERNAL_H_ */

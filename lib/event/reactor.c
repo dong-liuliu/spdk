@@ -96,6 +96,28 @@ spdk_reactor_get(uint32_t lcore)
 static int spdk_reactor_thread_op(struct spdk_thread *thread, enum spdk_thread_op op);
 static bool spdk_reactor_thread_op_supported(enum spdk_thread_op op);
 
+int spdk_reactor_event_callback(void *cb_arg);
+
+static int
+spdk_reactors_edriven_init(int num_lcores)
+{
+	int i, rc;
+	char name[SPDK_MAX_EDRIVEN_NAME_LEN + 1];
+
+	for (i = 0; i < num_lcores; i++) {
+		struct spdk_reactor *reactor = spdk_reactor_get(i);
+
+		snprintf(name, sizeof(name), "reactor-%d", i);
+		rc = spdk_edriven_reactor_init(i, spdk_reactor_event_callback, reactor, name);
+		assert(rc == 0);
+		(void)rc;
+
+		reactor->edriven = true;
+	}
+
+	return 0;
+}
+
 int
 spdk_reactors_init(void)
 {
@@ -135,6 +157,12 @@ spdk_reactors_init(void)
 		spdk_reactor_construct(&g_reactors[i], i);
 	}
 
+	if (spdk_is_edriven_mode()) {
+		rc = spdk_reactors_edriven_init(last_core + 1);
+		assert(rc == 0);
+		(void)rc;
+	}
+
 	g_reactor_state = SPDK_REACTOR_STATE_INITIALIZED;
 
 	return 0;
@@ -157,6 +185,12 @@ spdk_reactors_fini(void)
 		assert(reactor->thread_count == 0);
 		if (spdk_likely(reactor != NULL) && reactor->events != NULL) {
 			spdk_ring_free(reactor->events);
+		}
+
+		if (reactor->edriven) {
+			int rc = spdk_edriven_reactor_fini(i);
+			assert(rc == 0);
+			(void)rc;
 		}
 	}
 
@@ -206,6 +240,12 @@ spdk_event_call(struct spdk_event *event)
 	if (rc != 1) {
 		assert(false);
 	}
+
+	if (reactor->edriven) {
+		rc = spdk_edriven_reactor_event_notify(event->lcore);
+		assert(rc == 0);
+		(void)rc;
+	}
 }
 
 static inline uint32_t
@@ -228,6 +268,13 @@ _spdk_event_queue_run_batch(struct spdk_reactor *reactor)
 	count = spdk_ring_dequeue(reactor->events, events, SPDK_EVENT_BATCH_SIZE);
 	if (count == 0) {
 		return 0;
+	}
+
+	if (reactor->edriven) {
+		if (spdk_ring_count(reactor->events) == 0) {
+			/* clear level trigger, so only new event is notified, event-queue will get processed. */
+			spdk_edriven_reactor_events_level_clear(reactor->lcore);
+		}
 	}
 
 	/* Execute the events. There are still some remaining events
@@ -310,6 +357,74 @@ _set_thread_name(const char *thread_name)
 static int _reactor_schedule_thread(struct spdk_thread *thread);
 static uint64_t g_rusage_period;
 
+
+// CHANGE: edriven
+/* callback function for reactor's origin eventfd which is used for reactor event queue */
+int
+spdk_reactor_event_callback(void *cb_arg)
+{
+	struct spdk_reactor *reactor = cb_arg;
+	struct spdk_thread	*thread;
+	struct spdk_lw_thread	*lw_thread, *tmp;
+	uint32_t count;
+
+	// Process the reactor events which has the real notify
+	// TODO: consider batch process won't clean the level trigger. in event callback, new events may be added.
+	count = _spdk_event_queue_run_batch(reactor);
+
+	// Check for thread's exit and idle state
+	TAILQ_FOREACH_SAFE(lw_thread, &reactor->threads, link, tmp) {
+		thread = spdk_thread_get_from_ctx(lw_thread);
+
+		if (spdk_unlikely(lw_thread->resched)) {
+			lw_thread->resched = false;
+			TAILQ_REMOVE(&reactor->threads, lw_thread, link);
+			assert(reactor->thread_count > 0);
+			reactor->thread_count--;
+
+			// TODO: edriven
+			int rc = spdk_edriven_reactor_remove_thread(reactor->lcore, thread);
+			assert(rc == 0);
+			(void)rc;
+
+			_reactor_schedule_thread(thread);
+			continue;
+		}
+
+		if (spdk_unlikely(spdk_thread_is_exited(thread) &&
+				  spdk_thread_is_idle(thread))) {
+			TAILQ_REMOVE(&reactor->threads, lw_thread, link);
+			assert(reactor->thread_count > 0);
+			reactor->thread_count--;
+
+			int rc = spdk_edriven_reactor_remove_thread(reactor->lcore, thread);
+			assert(rc == 0);
+			(void)rc;
+
+			spdk_thread_destroy(thread);
+			continue;
+		}
+	}
+
+	return count;
+}
+
+/* epoll_wait for reactor epfd, and call related callback_fn if any event occurs.
+ *
+ * called in _spdk_reactor_run as a replacement for reactor_run
+ * function reactor_run() should be split and replaced.
+ */
+static void
+spdk_reactor_edriven_main(struct spdk_reactor *reactor)
+{
+	struct spdk_edriven_group *reactor_egrp = spdk_edriven_get_reactor_egrp(reactor->lcore);
+	int block_timeout = -1; //_EPOLL_WAIT_FOREVER;
+
+	spdk_edriven_group_wait(reactor_egrp, block_timeout);
+
+	return;
+}
+
 static void
 reactor_run(struct spdk_reactor *reactor)
 {
@@ -321,12 +436,15 @@ reactor_run(struct spdk_reactor *reactor)
 	 * is used for all threads. */
 	now = spdk_get_ticks();
 
+	// CHANGE done: edriven: covered by _reactor_event_callback()
 	_spdk_event_queue_run_batch(reactor);
 
 	TAILQ_FOREACH_SAFE(lw_thread, &reactor->threads, link, tmp) {
 		thread = spdk_thread_get_from_ctx(lw_thread);
+		// TODO: edriven: covered by  _reactor_edriven_thread_main and _thread_msg_callback
 		spdk_thread_poll(thread, 0, now);
 
+		// TODO: edriven: covered by event notify change in spdk_thread_set_cpumask
 		if (spdk_unlikely(lw_thread->resched)) {
 			lw_thread->resched = false;
 			TAILQ_REMOVE(&reactor->threads, lw_thread, link);
@@ -336,6 +454,7 @@ reactor_run(struct spdk_reactor *reactor)
 			continue;
 		}
 
+		// TODO: edriven: covered by event notify change in spdk_thread_exit
 		if (spdk_unlikely(spdk_thread_is_exited(thread) &&
 				  spdk_thread_is_idle(thread))) {
 			TAILQ_REMOVE(&reactor->threads, lw_thread, link);
@@ -346,6 +465,7 @@ reactor_run(struct spdk_reactor *reactor)
 		}
 	}
 
+	// TODO: edriven
 	if (g_framework_context_switch_monitor_enabled) {
 		if ((reactor->last_rusage + g_rusage_period) < now) {
 			get_rusage(reactor);
@@ -371,8 +491,13 @@ _spdk_reactor_run(void *arg)
 	snprintf(thread_name, sizeof(thread_name), "reactor_%u", reactor->lcore);
 	_set_thread_name(thread_name);
 
+	void (* reactor_core_func)(struct spdk_reactor * reactor) = reactor_run;
+	if (reactor->edriven) {
+		reactor_core_func = spdk_reactor_edriven_main;
+	}
+
 	while (1) {
-		reactor_run(reactor);
+		reactor_core_func(reactor);
 
 		if (g_reactor_state != SPDK_REACTOR_STATE_RUNNING) {
 			break;
@@ -388,7 +513,15 @@ _spdk_reactor_run(void *arg)
 		if (!spdk_thread_is_exited(thread)) {
 			rc = spdk_thread_exit(thread);
 			assert(rc == 0);
+			(void)rc;
 		}
+
+		if (reactor->edriven) {
+			int rc = spdk_edriven_reactor_remove_thread(reactor->lcore, thread);
+			assert(rc == 0);
+			(void)rc;
+		}
+
 		spdk_thread_destroy(thread);
 	}
 
@@ -469,11 +602,27 @@ spdk_reactors_start(void)
 void
 spdk_reactors_stop(void *arg1)
 {
+	uint32_t i;
+	int rc;
+	struct spdk_reactor *reactor;
+
 	g_reactor_state = SPDK_REACTOR_STATE_EXITING;
+
+	/* each reactor should be notified to exit */
+	if (spdk_is_edriven_mode()) {
+		SPDK_ENV_FOREACH_CORE(i) {
+			reactor = spdk_reactor_get(i);
+
+			rc = spdk_edriven_reactor_event_notify(reactor->lcore);
+			assert(rc == 0);
+			(void)rc;
+		}
+	}
 }
 
 static pthread_mutex_t g_scheduler_mtx = PTHREAD_MUTEX_INITIALIZER;
 static uint32_t g_next_core = UINT32_MAX;
+
 
 static void
 _schedule_thread(void *arg1, void *arg2)
@@ -498,6 +647,12 @@ _schedule_thread(void *arg1, void *arg2)
 
 	TAILQ_INSERT_TAIL(&reactor->threads, lw_thread, link);
 	reactor->thread_count++;
+
+	if (reactor->edriven) {
+		int rc = spdk_edriven_reactor_add_thread(current_core, thread);
+		assert(rc == 0);
+		(void)rc;
+	}
 }
 
 static int
@@ -551,6 +706,10 @@ _reactor_request_thread_reschedule(struct spdk_thread *thread)
 	lw_thread = spdk_thread_get_ctx(thread);
 
 	lw_thread->resched = true;
+
+	// TODO: edriven
+	// temporary not do event notify, just rely on other reactor's events
+	//spdk_reactor_event_notify();
 }
 
 static int
