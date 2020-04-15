@@ -82,6 +82,13 @@
 typedef struct rte_vhost_resubmit_desc spdk_vhost_resubmit_desc;
 typedef struct rte_vhost_resubmit_info spdk_vhost_resubmit_info;
 
+
+struct spdk_vhost_blk_kick_ctx {
+	struct spdk_vhost_blk_session *bvsession;
+	struct spdk_vhost_virtqueue *vq;
+	struct spdk_poller *vq_poller;
+};
+
 struct spdk_vhost_virtqueue {
 	struct rte_vhost_vring vring;
 	struct rte_vhost_ring_inflight vring_inflight;
@@ -104,6 +111,8 @@ struct spdk_vhost_virtqueue {
 
 	/* Associated vhost_virtqueue in the virtio device's virtqueue list */
 	uint32_t vring_idx;
+
+	struct spdk_vhost_blk_kick_ctx kick_ctx;
 } __attribute((aligned(SPDK_CACHE_LINE_SIZE)));
 
 struct spdk_vhost_session {
@@ -121,6 +130,7 @@ struct spdk_vhost_session {
 	bool started;
 	bool needs_restart;
 	bool forced_polling;
+	bool edriven;
 
 	struct rte_vhost_memory *mem;
 

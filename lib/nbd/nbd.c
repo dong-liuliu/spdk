@@ -46,6 +46,8 @@
 #include "spdk/thread.h"
 #include "spdk/event.h"
 
+#include "spdk/edriven.h"
+
 #include "spdk_internal/log.h"
 #include "spdk/queue.h"
 
@@ -112,6 +114,8 @@ struct spdk_nbd_disk {
 	enum nbd_disk_state_t	state;
 	/* count of nbd_io in spdk_nbd_disk */
 	int			io_count;
+
+	bool			edriven;
 
 	TAILQ_ENTRY(spdk_nbd_disk)	tailq;
 };
@@ -355,6 +359,14 @@ _nbd_stop(struct spdk_nbd_disk *nbd)
 		spdk_bdev_close(nbd->bdev_desc);
 	}
 
+	if (nbd->nbd_poller) {
+		if (nbd->edriven) {
+			spdk_edriven_thread_unregister_esrc((struct spdk_edriven_esrc **)&nbd->nbd_poller);
+		} else {
+			spdk_poller_unregister(&nbd->nbd_poller);
+		}
+	}
+
 	if (nbd->spdk_sp_fd >= 0) {
 		close(nbd->spdk_sp_fd);
 	}
@@ -374,10 +386,6 @@ _nbd_stop(struct spdk_nbd_disk *nbd)
 
 	if (nbd->nbd_path) {
 		free(nbd->nbd_path);
-	}
-
-	if (nbd->nbd_poller) {
-		spdk_poller_unregister(&nbd->nbd_poller);
 	}
 
 	spdk_nbd_disk_unregister(nbd);
@@ -451,6 +459,11 @@ nbd_io_done(struct spdk_bdev_io *bdev_io, bool success, void *cb_arg)
 	}
 
 	memcpy(&io->resp.handle, &io->req.handle, sizeof(io->resp.handle));
+
+	if (nbd->edriven && TAILQ_EMPTY(&nbd->executed_io_list)) {
+		spdk_edriven_thread_nbd_change_trigger((struct spdk_edriven_esrc *)nbd->nbd_poller, false);
+	}
+
 	TAILQ_INSERT_TAIL(&nbd->executed_io_list, io, tailq);
 
 	if (bdev_io != NULL) {
@@ -525,6 +538,11 @@ nbd_submit_bdev_io(struct spdk_nbd_disk *nbd, struct nbd_io *io)
 	case NBD_CMD_DISC:
 		spdk_put_nbd_io(nbd, io);
 		nbd->state = NBD_DISK_STATE_SOFTDISC;
+
+		if (nbd->edriven && TAILQ_EMPTY(&nbd->executed_io_list)) {
+			spdk_edriven_thread_nbd_change_trigger((struct spdk_edriven_esrc *)nbd->nbd_poller, false);
+		}
+
 		break;
 	default:
 		rc = -1;
@@ -767,6 +785,10 @@ spdk_nbd_io_xmit(struct spdk_nbd_disk *nbd)
 		if (ret != 0) {
 			return ret;
 		}
+
+		if (nbd->edriven && TAILQ_EMPTY(&nbd->executed_io_list)) {
+			spdk_edriven_thread_nbd_change_trigger((struct spdk_edriven_esrc *)nbd->nbd_poller, true);
+		}
 	}
 
 	/*
@@ -776,6 +798,7 @@ spdk_nbd_io_xmit(struct spdk_nbd_disk *nbd)
 	if (nbd->state == NBD_DISK_STATE_SOFTDISC && !spdk_nbd_io_xmit_check(nbd)) {
 		return -1;
 	}
+
 
 	return 0;
 }
@@ -791,6 +814,7 @@ _spdk_nbd_poll(struct spdk_nbd_disk *nbd)
 	int rc;
 
 	/* transmit executed io first */
+	// CHANGED: edriven: requires a way to trigger xmit
 	rc = spdk_nbd_io_xmit(nbd);
 	if (rc < 0) {
 		return rc;
@@ -911,7 +935,12 @@ spdk_nbd_start_complete(struct spdk_nbd_start_ctx *ctx)
 		goto err;
 	}
 
-	ctx->nbd->nbd_poller = spdk_poller_register(spdk_nbd_poll, ctx->nbd, 0);
+	if (!ctx->nbd->edriven) {
+		ctx->nbd->nbd_poller = spdk_poller_register(spdk_nbd_poll, ctx->nbd, 0);
+	} else {
+		ctx->nbd->nbd_poller = (struct spdk_poller *)spdk_edriven_thread_register_nbd(spdk_nbd_poll,
+				       ctx->nbd, "nbd", ctx->nbd->spdk_sp_fd);
+	}
 
 	if (ctx->cb_fn) {
 		ctx->cb_fn(ctx->cb_arg, ctx->nbd, 0);
@@ -939,8 +968,14 @@ spdk_nbd_enable_kernel(void *arg)
 	if (rc == -1) {
 		if (errno == EBUSY && ctx->polling_count-- > 0) {
 			if (ctx->poller == NULL) {
-				ctx->poller = spdk_poller_register(spdk_nbd_enable_kernel, ctx,
-								   NBD_BUSY_POLLING_INTERVAL_US);
+				if (!ctx->nbd->edriven) {
+					ctx->poller = spdk_poller_register(spdk_nbd_enable_kernel, ctx,
+									   NBD_BUSY_POLLING_INTERVAL_US);
+				} else {
+					ctx->poller = (struct spdk_poller *)spdk_edriven_thread_register_interval_esrc(
+							      spdk_nbd_enable_kernel, ctx,
+							      NBD_BUSY_POLLING_INTERVAL_US, "spdk_nbd_enable_kernel");
+				}
 			}
 			/* If the kernel is busy, check back later */
 			return 0;
@@ -948,7 +983,11 @@ spdk_nbd_enable_kernel(void *arg)
 
 		SPDK_ERRLOG("ioctl(NBD_SET_SOCK) failed: %s\n", spdk_strerror(errno));
 		if (ctx->poller) {
-			spdk_poller_unregister(&ctx->poller);
+			if (!ctx->nbd->edriven) {
+				spdk_poller_unregister(&ctx->poller);
+			} else {
+				spdk_edriven_thread_unregister_esrc((struct spdk_edriven_esrc **)&ctx->poller);
+			}
 		}
 
 		spdk_nbd_stop(ctx->nbd);
@@ -962,7 +1001,11 @@ spdk_nbd_enable_kernel(void *arg)
 	}
 
 	if (ctx->poller) {
-		spdk_poller_unregister(&ctx->poller);
+		if (!ctx->nbd->edriven) {
+			spdk_poller_unregister(&ctx->poller);
+		} else {
+			spdk_edriven_thread_unregister_esrc((struct spdk_edriven_esrc **)&ctx->poller);
+		}
 	}
 
 	spdk_nbd_start_complete(ctx);
@@ -996,6 +1039,7 @@ spdk_nbd_start(const char *bdev_name, const char *nbd_path,
 	nbd->dev_fd = -1;
 	nbd->spdk_sp_fd = -1;
 	nbd->kernel_sp_fd = -1;
+	nbd->edriven = spdk_is_edriven_mode();
 
 	ctx = calloc(1, sizeof(*ctx));
 	if (ctx == NULL) {

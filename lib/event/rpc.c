@@ -39,6 +39,8 @@
 #include "spdk/log.h"
 #include "spdk/rpc.h"
 
+#include "spdk/edriven.h"
+
 #include "spdk_internal/event.h"
 
 #define RPC_SELECT_INTERVAL	4000 /* 4ms */
@@ -76,12 +78,22 @@ spdk_rpc_initialize(const char *listen_addr)
 	spdk_rpc_set_state(SPDK_RPC_STARTUP);
 
 	/* Register a poller to periodically check for RPCs */
-	g_rpc_poller = spdk_poller_register(spdk_rpc_subsystem_poll, NULL, RPC_SELECT_INTERVAL);
+	if (!spdk_is_edriven_mode()) {
+		g_rpc_poller = spdk_poller_register(spdk_rpc_subsystem_poll, NULL, RPC_SELECT_INTERVAL);
+	} else {
+		g_rpc_poller = (struct spdk_poller *)spdk_edriven_thread_register_interval_esrc(
+				       spdk_rpc_subsystem_poll, NULL, RPC_SELECT_INTERVAL, "spdk_rpc_subsystem_poll");
+	}
 }
 
 void
 spdk_rpc_finish(void)
 {
 	spdk_rpc_close();
-	spdk_poller_unregister(&g_rpc_poller);
+
+	if (!spdk_is_edriven_mode()) {
+		spdk_poller_unregister(&g_rpc_poller);
+	} else {
+		spdk_edriven_thread_unregister_esrc((struct spdk_edriven_esrc **)&g_rpc_poller);
+	}
 }

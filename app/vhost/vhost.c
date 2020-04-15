@@ -35,6 +35,7 @@
 
 #include "spdk/conf.h"
 #include "spdk/event.h"
+#include "spdk/edriven.h"
 
 #include "spdk/vhost.h"
 
@@ -45,6 +46,7 @@ vhost_usage(void)
 {
 	printf(" -f <path>                 save pid to file under given path\n");
 	printf(" -S <path>                 directory where to create vhost sockets (default: pwd)\n");
+	printf(" -E                        Set event driven mode\n");
 }
 
 static void
@@ -72,6 +74,9 @@ vhost_parse_arg(int ch, char *arg)
 	case 'S':
 		spdk_vhost_set_socket_path(arg);
 		break;
+	case 'E':
+		spdk_set_edriven_mode();
+		break;
 	default:
 		return -EINVAL;
 	}
@@ -92,7 +97,7 @@ main(int argc, char *argv[])
 	spdk_app_opts_init(&opts);
 	opts.name = "vhost";
 
-	if ((rc = spdk_app_parse_args(argc, argv, &opts, "f:S:", NULL,
+	if ((rc = spdk_app_parse_args(argc, argv, &opts, "f:S:E", NULL,
 				      vhost_parse_arg, vhost_usage)) !=
 	    SPDK_APP_PARSE_ARGS_SUCCESS) {
 		exit(rc);

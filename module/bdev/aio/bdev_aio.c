@@ -49,6 +49,8 @@
 
 #include "spdk_internal/log.h"
 
+#include "spdk/edriven.h"
+
 #include <libaio.h>
 
 struct bdev_aio_io_channel {
@@ -76,6 +78,7 @@ struct file_disk {
 	int			fd;
 	TAILQ_ENTRY(file_disk)  link;
 	bool			block_size_override;
+	bool			edriven;
 };
 
 /* For user space reaping of completions */
@@ -161,6 +164,18 @@ bdev_aio_close(struct file_disk *disk)
 	return 0;
 }
 
+// CHANGE: edriven
+static inline int
+bdev_aio_request_edriven(struct iocb *iocb, struct bdev_aio_io_channel *aio_ch)
+{
+	int aio_efd = spdk_edriven_esrc_get_efd(spdk_poller_to_edriven_source(aio_ch->group_ch->poller));
+	assert(aio_efd > 0);
+
+	io_set_eventfd(iocb, aio_efd);
+
+	return 0;
+}
+
 static int64_t
 bdev_aio_readv(struct file_disk *fdisk, struct spdk_io_channel *ch,
 	       struct bdev_aio_task *aio_task,
@@ -171,6 +186,11 @@ bdev_aio_readv(struct file_disk *fdisk, struct spdk_io_channel *ch,
 	int rc;
 
 	io_prep_preadv(iocb, fdisk->fd, iov, iovcnt, offset);
+
+	if (fdisk->edriven) {
+		bdev_aio_request_edriven(iocb, aio_ch);
+	}
+
 	iocb->data = aio_task;
 	aio_task->len = nbytes;
 	aio_task->ch = aio_ch;
@@ -202,6 +222,11 @@ bdev_aio_writev(struct file_disk *fdisk, struct spdk_io_channel *ch,
 	int rc;
 
 	io_prep_pwritev(iocb, fdisk->fd, iov, iovcnt, offset);
+
+	if (fdisk->edriven) {
+		bdev_aio_request_edriven(iocb, aio_ch);
+	}
+
 	iocb->data = aio_task;
 	aio_task->len = len;
 	aio_task->ch = aio_ch;
@@ -248,6 +273,7 @@ bdev_aio_destruct(void *ctx)
 	return rc;
 }
 
+// TODO: edriven
 static int
 bdev_user_io_getevents(io_context_t io_ctx, unsigned int max, struct io_event *uevents)
 {
@@ -311,6 +337,10 @@ bdev_user_io_getevents(io_context_t io_ctx, unsigned int max, struct io_event *u
 	return count;
 }
 
+// TODO: edriven
+// efd for aio poll is EPOLLET, so if completed IO number is SPDK_AIO_QUEUE_DEPTH,
+// io_getevent should be called again to ensure all io are completed.
+// whether to use "read(efd, &finished_aio, sizeof(finished_aio)"
 static int
 bdev_aio_group_poll(void *arg)
 {
@@ -320,6 +350,7 @@ bdev_aio_group_poll(void *arg)
 	struct bdev_aio_task *aio_task;
 	struct io_event events[SPDK_AIO_QUEUE_DEPTH];
 
+again:// edriven
 	nr = bdev_user_io_getevents(group_ch->io_ctx, SPDK_AIO_QUEUE_DEPTH, events);
 
 	if (nr < 0) {
@@ -336,6 +367,10 @@ bdev_aio_group_poll(void *arg)
 
 		spdk_bdev_io_complete(spdk_bdev_io_from_ctx(aio_task), status);
 		aio_task->ch->io_inflight--;
+	}
+
+	if (nr == SPDK_AIO_QUEUE_DEPTH) {
+		goto again;
 	}
 
 	return nr;
@@ -556,6 +591,7 @@ static void aio_free_disk(struct file_disk *fdisk)
 	free(fdisk);
 }
 
+// CHANGE: edriven
 static int
 bdev_aio_group_create_cb(void *io_device, void *ctx_buf)
 {
@@ -566,10 +602,16 @@ bdev_aio_group_create_cb(void *io_device, void *ctx_buf)
 		return -1;
 	}
 
-	ch->poller = spdk_poller_register(bdev_aio_group_poll, ch, 0);
+	if (!spdk_is_edriven_mode()) {
+		ch->poller = spdk_poller_register(bdev_aio_group_poll, ch, 0);
+	} else {
+		ch->poller = (struct spdk_poller *)spdk_edriven_thread_register_aio(bdev_aio_group_poll, ch, "aio");
+	}
+
 	return 0;
 }
 
+// CHANGE: edriven
 static void
 bdev_aio_group_destroy_cb(void *io_device, void *ctx_buf)
 {
@@ -577,7 +619,11 @@ bdev_aio_group_destroy_cb(void *io_device, void *ctx_buf)
 
 	io_destroy(ch->io_ctx);
 
-	spdk_poller_unregister(&ch->poller);
+	if (!spdk_is_edriven_mode()) {
+		spdk_poller_unregister(&ch->poller);
+	} else {
+		spdk_edriven_thread_unregister_esrc((struct spdk_edriven_esrc **)&ch->poller);
+	}
 }
 
 int
@@ -592,6 +638,10 @@ create_aio_bdev(const char *name, const char *filename, uint32_t block_size)
 	if (!fdisk) {
 		SPDK_ERRLOG("Unable to allocate enough memory for aio backend\n");
 		return -ENOMEM;
+	}
+
+	if (spdk_is_edriven_mode()) {
+		fdisk->edriven = true;
 	}
 
 	fdisk->filename = strdup(filename);

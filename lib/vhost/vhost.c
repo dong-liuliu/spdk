@@ -42,6 +42,8 @@
 #include "spdk/vhost.h"
 #include "vhost_internal.h"
 
+#include "spdk/edriven.h"
+
 /* Path to folder where character device will be created. Can be set by user. */
 static char dev_dirname[PATH_MAX] = "";
 
@@ -432,6 +434,16 @@ vhost_vq_used_ring_enqueue(struct spdk_vhost_session *vsession,
 	rte_vhost_clr_inflight_desc_split(vsession->vid, vq_idx, virtqueue->last_used_idx, id);
 
 	virtqueue->used_req_cnt++;
+
+
+	if (vsession->edriven) {
+		if (virtqueue->vring.desc == NULL ||
+		    (virtqueue->vring.avail->flags & VRING_AVAIL_F_NO_INTERRUPT)) {
+			return;
+		}
+
+		vhost_vq_used_signal(vsession, virtqueue);
+	}
 }
 
 int
@@ -937,6 +949,10 @@ vhost_start_device_cb(int vid)
 		goto out;
 	}
 
+	if (spdk_is_edriven_mode()) {
+		vsession->edriven = true;
+	}
+
 	vdev = vsession->vdev;
 	if (vsession->started) {
 		/* already started, nothing to do */
@@ -966,7 +982,10 @@ vhost_start_device_cb(int vid)
 		}
 
 		/* Disable I/O submission notifications, we'll be polling. */
-		q->vring.used->flags = VRING_USED_F_NO_NOTIFY;
+		if (!vsession->edriven) {
+			q->vring.used->flags = VRING_USED_F_NO_NOTIFY;
+		}
+
 		vsession->max_queues = i + 1;
 	}
 
