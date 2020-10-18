@@ -304,6 +304,11 @@ build_eal_cmdline(const struct spdk_env_opts *opts)
 		}
 	}
 
+	args = push_arg(args, &argcount, _sprintf_alloc("--no-huge"));
+        if (args == NULL) {
+                return -1;
+        }
+
 	/* set no pci  if enabled */
 	if (opts->no_pci) {
 		args = push_arg(args, &argcount, _sprintf_alloc("--no-pci"));
@@ -410,12 +415,15 @@ build_eal_cmdline(const struct spdk_env_opts *opts)
 		 * virtual machines) don't have an IOMMU capable of handling the full virtual
 		 * address space and DPDK doesn't currently catch that. Add a check in SPDK
 		 * and force iova-mode=pa here. */
+		(void)get_iommu_width;
+/*
 		if (get_iommu_width() < SPDK_IOMMU_VA_REQUIRED_WIDTH) {
 			args = push_arg(args, &argcount, _sprintf_alloc("--iova-mode=pa"));
 			if (args == NULL) {
 				return -1;
 			}
 		}
+*/
 #elif defined(__PPC64__)
 		/* On Linux + PowerPC, DPDK doesn't support VA mode at all. Unfortunately, it doesn't correctly
 		 * auto-detect at the moment, so we'll just force it here. */
@@ -444,12 +452,14 @@ build_eal_cmdline(const struct spdk_env_opts *opts)
 	 * the memory for a buffer over two allocations meaning the buffer will be split over a memory region.
 	 */
 #if RTE_VERSION >= RTE_VERSION_NUM(19, 02, 0, 0)
+/*
 	if (!opts->env_context || strstr(opts->env_context, "--legacy-mem") == NULL) {
 		args = push_arg(args, &argcount, _sprintf_alloc("%s", "--match-allocations"));
 		if (args == NULL) {
 			return -1;
 		}
 	}
+*/
 #endif
 
 	if (opts->shm_id < 0) {
