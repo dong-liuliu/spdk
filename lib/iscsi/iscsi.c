@@ -1084,6 +1084,20 @@ iscsi_check_values(struct spdk_iscsi_conn *conn)
 	return 0;
 }
 
+void
+iscsi_conn_operation_notify(struct spdk_iscsi_conn *conn)
+{
+	if (conn->pg->cop_intr) {
+		uint64_t notify = 1;
+		int rc;
+
+		rc = write(conn->pg->cop_efd, &notify, sizeof(notify));
+		if (rc < 0) {
+			SPDK_ERRLOG("failed to notify iscsi conn operation: %s.\n", spdk_strerror(errno));
+		}
+	}
+}
+
 static int
 iscsi_conn_params_update(struct spdk_iscsi_conn *conn)
 {
@@ -1096,6 +1110,7 @@ iscsi_conn_params_update(struct spdk_iscsi_conn *conn)
 		SPDK_ERRLOG("iscsi_copy_param2var() failed\n");
 		if (conn->state < ISCSI_CONN_STATE_EXITING) {
 			conn->state = ISCSI_CONN_STATE_EXITING;
+			iscsi_conn_operation_notify(conn);
 		}
 		return rc;
 	}
@@ -1106,6 +1121,7 @@ iscsi_conn_params_update(struct spdk_iscsi_conn *conn)
 		SPDK_ERRLOG("iscsi_check_values() failed\n");
 		if (conn->state < ISCSI_CONN_STATE_EXITING) {
 			conn->state = ISCSI_CONN_STATE_EXITING;
+			iscsi_conn_operation_notify(conn);
 		}
 	}
 

@@ -297,6 +297,9 @@ struct spdk_iscsi_sess {
 };
 
 struct spdk_iscsi_poll_group {
+	int						cop_efd;
+	struct spdk_interrupt				*cop_intr;
+	struct spdk_interrupt				*sg_intrs[3];
 	struct spdk_poller				*poller;
 	struct spdk_poller				*nop_poller;
 	STAILQ_HEAD(connections, spdk_iscsi_conn)	connections;
@@ -467,5 +470,7 @@ iscsi_get_max_immediate_data_size(void)
 	       8 +		   /* bidirectional AHS */
 	       52;		   /* extended CDB AHS (for a 64-byte CDB) */
 }
+
+void iscsi_conn_operation_notify(struct spdk_iscsi_conn *conn);
 
 #endif /* SPDK_ISCSI_H */

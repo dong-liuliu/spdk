@@ -47,6 +47,10 @@
 
 #include "spdk/log.h"
 
+#ifdef __linux__
+#include <sys/eventfd.h>
+#endif
+
 struct spdk_iscsi_opts *g_spdk_iscsi_opts = NULL;
 
 static struct spdk_thread *g_init_thread = NULL;
@@ -945,6 +949,29 @@ iscsi_parse_configuration(void)
 }
 
 static int
+iscsi_poll_group_cop(void *ctx)
+{
+	struct spdk_iscsi_poll_group *group = ctx;
+	struct spdk_iscsi_conn *conn, *tmp;
+	int64_t num_events;
+	int rc;
+
+	rc = read(group->cop_efd, &num_events, sizeof(num_events));
+	if (rc < 0) {
+		SPDK_ERRLOG("failed to acknowledge aio group: %s.\n", spdk_strerror(errno));
+		return -errno;
+	}
+
+	STAILQ_FOREACH_SAFE(conn, &group->connections, pg_link, tmp) {
+		if (conn->state == ISCSI_CONN_STATE_EXITING) {
+			iscsi_conn_destruct(conn);
+		}
+	}
+
+	return 0;
+}
+
+static int
 iscsi_poll_group_poll(void *ctx)
 {
 	struct spdk_iscsi_poll_group *group = ctx;
@@ -982,6 +1009,59 @@ iscsi_poll_group_handle_nop(void *ctx)
 	return SPDK_POLLER_BUSY;
 }
 
+static void
+iscsi_poll_group_destroy_intr(struct spdk_iscsi_poll_group *pg)
+{
+	int i;
+
+	for (i = 0; pg->sg_intrs[i]; i++) {
+		spdk_interrupt_unregister(&pg->sg_intrs[i]);
+	}
+
+	if (pg->cop_intr) {
+		spdk_interrupt_unregister(&pg->cop_intr);
+		close(pg->cop_efd);
+	}
+}
+
+static int
+iscsi_poll_group_create_intr(struct spdk_iscsi_poll_group *pg)
+{
+#define NUM_SOCK_GROUP_IMPL 3
+	struct spdk_sock_group_intr_info intr_infos[NUM_SOCK_GROUP_IMPL];
+	int rc, i;
+
+	rc = spdk_sock_group_set_intr(pg->sock_group);
+	assert(rc == 0);
+	rc = spdk_sock_group_get_intr_info(pg->sock_group, intr_infos, NUM_SOCK_GROUP_IMPL);
+	assert(rc > 0 && rc <= NUM_SOCK_GROUP_IMPL);
+	for (i = 0; i < rc; i++) {
+		SPDK_NOTICELOG("sock_impl(%s) has intr_fd(%d)\n",
+			       intr_infos[i].impl_name, intr_infos[i].intr_fd);
+	}
+
+	for (i = 0; i < rc; i++) {
+		if (intr_infos[i].intr_fd <= 0) {
+			continue;
+		}
+		pg->sg_intrs[i] = SPDK_INTERRUPT_REGISTER(intr_infos[i].intr_fd,
+				  (spdk_interrupt_fn)spdk_sock_group_intr_process, intr_infos[i].intr_arg);
+		assert(pg->sg_intrs[i]);
+	}
+
+	int efd;
+	efd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
+	if (efd < 0) {
+		return -1;
+	}
+
+	pg->cop_efd = efd;
+	pg->cop_intr = SPDK_INTERRUPT_REGISTER(efd, iscsi_poll_group_cop, pg);
+	assert(pg->cop_intr);
+
+	return 0;
+}
+
 static int
 iscsi_poll_group_create(void *io_device, void *ctx_buf)
 {
@@ -991,7 +1071,15 @@ iscsi_poll_group_create(void *io_device, void *ctx_buf)
 	pg->sock_group = spdk_sock_group_create(NULL);
 	assert(pg->sock_group != NULL);
 
-	pg->poller = SPDK_POLLER_REGISTER(iscsi_poll_group_poll, pg, 0);
+	if (spdk_interrupt_mode_is_enabled()) {
+		int rc __attribute__((unused));
+
+		rc = iscsi_poll_group_create_intr(pg);
+		assert(rc == 0);
+	} else {
+		pg->poller = SPDK_POLLER_REGISTER(iscsi_poll_group_poll, pg, 0);
+	}
+
 	/* set the period to 1 sec */
 	pg->nop_poller = SPDK_POLLER_REGISTER(iscsi_poll_group_handle_nop, pg, 1000000);
 
@@ -1005,9 +1093,10 @@ iscsi_poll_group_destroy(void *io_device, void *ctx_buf)
 	struct spdk_io_channel *ch;
 	struct spdk_thread *thread;
 
-	assert(pg->poller != NULL);
-	assert(pg->sock_group != NULL);
+	//assert(pg->poller != NULL);
+	//assert(pg->sock_group != NULL);
 
+	iscsi_poll_group_destroy_intr(pg);
 	spdk_sock_group_close(&pg->sock_group);
 	spdk_poller_unregister(&pg->poller);
 	spdk_poller_unregister(&pg->nop_poller);

@@ -177,6 +177,7 @@ login_timeout(void *arg)
 
 	if (conn->state < ISCSI_CONN_STATE_EXITING) {
 		conn->state = ISCSI_CONN_STATE_EXITING;
+		iscsi_conn_operation_notify(conn);
 	}
 
 	return SPDK_POLLER_BUSY;
@@ -805,6 +806,7 @@ logout_request_timeout(void *arg)
 
 	if (conn->state < ISCSI_CONN_STATE_EXITING) {
 		conn->state = ISCSI_CONN_STATE_EXITING;
+		iscsi_conn_operation_notify(conn);
 	}
 
 	return SPDK_POLLER_BUSY;
@@ -837,6 +839,7 @@ iscsi_conn_request_logout(struct spdk_iscsi_conn *conn)
 	if (conn->state == ISCSI_CONN_STATE_INVALID) {
 		/* Move it to EXITING state if the connection is in login. */
 		conn->state = ISCSI_CONN_STATE_EXITING;
+		iscsi_conn_operation_notify(conn);
 	} else if (conn->state == ISCSI_CONN_STATE_RUNNING &&
 		   conn->logout_request_timer == NULL) {
 		thread = spdk_io_channel_get_thread(spdk_io_channel_from_ctx(conn->pg));
@@ -881,6 +884,7 @@ _iscsi_conn_drop(void *ctx)
 
 	if (conn->state < ISCSI_CONN_STATE_EXITING) {
 		conn->state = ISCSI_CONN_STATE_EXITING;
+		iscsi_conn_operation_notify(conn);
 	}
 }
 
@@ -1303,6 +1307,7 @@ iscsi_conn_handle_nop(struct spdk_iscsi_conn *conn)
 			SPDK_ERRLOG("  initiator=%s, target=%s\n", conn->initiator_name,
 				    conn->target_short_name);
 			conn->state = ISCSI_CONN_STATE_EXITING;
+			iscsi_conn_operation_notify(conn);
 		}
 	} else if (tsc - conn->last_nopin > conn->nopininterval) {
 		iscsi_conn_send_nopin(conn);
@@ -1451,6 +1456,7 @@ _iscsi_conn_pdu_write_done(void *cb_arg, int err)
 
 	if (err != 0) {
 		conn->state = ISCSI_CONN_STATE_EXITING;
+		iscsi_conn_operation_notify(conn);
 	} else {
 		spdk_trace_record(TRACE_ISCSI_FLUSH_WRITEBUF_DONE, conn->id, pdu->mapped_length, (uintptr_t)pdu, 0);
 	}
@@ -1485,6 +1491,7 @@ iscsi_conn_write_pdu(struct spdk_iscsi_conn *conn, struct spdk_iscsi_pdu *pdu,
 		if (rc != 0) {
 			iscsi_conn_free_pdu(conn, pdu);
 			conn->state = ISCSI_CONN_STATE_EXITING;
+			iscsi_conn_operation_notify(conn);
 			return;
 		}
 	}
@@ -1537,6 +1544,7 @@ iscsi_conn_sock_cb(void *arg, struct spdk_sock_group *group, struct spdk_sock *s
 	rc = iscsi_handle_incoming_pdus(conn);
 	if (rc < 0) {
 		conn->state = ISCSI_CONN_STATE_EXITING;
+		iscsi_conn_operation_notify(conn);
 	}
 }
 
@@ -1621,6 +1629,7 @@ logout_timeout(void *arg)
 
 	if (conn->state < ISCSI_CONN_STATE_EXITING) {
 		conn->state = ISCSI_CONN_STATE_EXITING;
+		iscsi_conn_operation_notify(conn);
 	}
 
 	return SPDK_POLLER_BUSY;
