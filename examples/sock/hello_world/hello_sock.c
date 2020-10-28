@@ -85,8 +85,12 @@ struct hello_context_t {
 	struct spdk_sock_group *group;
 	struct spdk_poller *poller_in;
 	struct spdk_poller *poller_out;
-	struct spdk_interrupt *intr_out[NUM_SOCK_GROUP_IMPL];
 	struct spdk_poller *time_out;
+	
+	struct spdk_interrupt *intr_out[NUM_SOCK_GROUP_IMPL];
+	struct spdk_interrupt *stdin_intr;
+	struct spdk_interrupt *sockin_intr;
+	struct spdk_interrupt *sockout_intr;
 
 	int rc;
 };
@@ -148,6 +152,8 @@ hello_sock_close_timeout_poll(void *arg)
 
 	spdk_poller_unregister(&ctx->time_out);
 	spdk_poller_unregister(&ctx->poller_in);
+	spdk_interrupt_unregister(&ctx->sockin_intr);
+	spdk_interrupt_unregister(&ctx->sockout_intr);
 	spdk_sock_close(&ctx->sock);
 	spdk_sock_group_close(&ctx->group);
 
@@ -160,11 +166,12 @@ hello_sock_quit(struct hello_context_t *ctx, int rc)
 {
 	ctx->rc = rc;
 	spdk_poller_unregister(&ctx->poller_out);
+	spdk_interrupt_unregister(&ctx->stdin_intr);
 	if (g_is_intr) {
 		int i;
 		for (i = 0; ctx->intr_out[i]; i++) {
 			spdk_interrupt_unregister(&ctx->intr_out[i]);
-		}
+		}		
 	}
 
 	if (!ctx->time_out) {
@@ -263,8 +270,22 @@ hello_sock_connect(struct hello_context_t *ctx)
 	fcntl(STDIN_FILENO, F_SETFL, fcntl(STDIN_FILENO, F_GETFL) | O_NONBLOCK);
 
 	g_is_running = true;
-	ctx->poller_in = SPDK_POLLER_REGISTER(hello_sock_recv_poll, ctx, 0);
-	ctx->poller_out = SPDK_POLLER_REGISTER(hello_sock_writev_poll, ctx, 0);
+
+	if (g_is_intr) {
+		int fd;
+
+		fd = spdk_sock_get_fd(ctx->sock);
+		assert(fd > 0);
+		ctx->stdin_intr = SPDK_INTERRUPT_REGISTER(STDIN_FILENO, hello_sock_writev_poll, ctx);
+		ctx->sockin_intr = SPDK_INTERRUPT_REGISTER(fd, hello_sock_recv_poll, ctx);
+		//ctx->sockout_intr = SPDK_INTERRUPT_REGISTER(STDIN_FILENO, , );
+		assert(ctx->stdin_intr);
+		assert(ctx->sockin_intr);
+	} else {
+		ctx->poller_in = SPDK_POLLER_REGISTER(hello_sock_recv_poll, ctx, 0);
+		ctx->poller_out = SPDK_POLLER_REGISTER(hello_sock_writev_poll, ctx, 0);
+	}
+
 
 	return 0;
 }
@@ -459,6 +480,8 @@ static void
 hello_sock_shutdown_cb(void)
 {
 	g_is_running = false;
+	int rc = close(STDIN_FILENO);
+	printf("close rc is %d\n", rc);
 }
 
 /*
