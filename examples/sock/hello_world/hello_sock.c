@@ -86,11 +86,12 @@ struct hello_context_t {
 	struct spdk_poller *poller_in;
 	struct spdk_poller *poller_out;
 	struct spdk_poller *time_out;
-	
+
 	struct spdk_interrupt *intr_out[NUM_SOCK_GROUP_IMPL];
 	struct spdk_interrupt *stdin_intr;
 	struct spdk_interrupt *sockin_intr;
 	struct spdk_interrupt *sockout_intr;
+	int sfdw; /* duplicated fd of client sock, used for epoll out */
 
 	int rc;
 };
@@ -153,7 +154,10 @@ hello_sock_close_timeout_poll(void *arg)
 	spdk_poller_unregister(&ctx->time_out);
 	spdk_poller_unregister(&ctx->poller_in);
 	spdk_interrupt_unregister(&ctx->sockin_intr);
-	spdk_interrupt_unregister(&ctx->sockout_intr);
+	if (ctx->sfdw > 0) {
+		close(ctx->sfdw);
+	}
+
 	spdk_sock_close(&ctx->sock);
 	spdk_sock_group_close(&ctx->group);
 
@@ -171,7 +175,7 @@ hello_sock_quit(struct hello_context_t *ctx, int rc)
 		int i;
 		for (i = 0; ctx->intr_out[i]; i++) {
 			spdk_interrupt_unregister(&ctx->intr_out[i]);
-		}		
+		}
 	}
 
 	if (!ctx->time_out) {
@@ -213,6 +217,40 @@ hello_sock_recv_poll(void *arg)
 }
 
 static int
+hello_sock_exit_poll(void *arg)
+{
+	struct hello_context_t *ctx = arg;
+
+	if (!g_is_running) {
+		/* EOF */
+		SPDK_NOTICELOG("Closing connection...\n");
+		hello_sock_quit(ctx, 0);
+		spdk_poller_unregister(&ctx->poller_in);
+	}
+
+	return 0;
+}
+
+static void
+hello_sock_write_async_cb(void *cb_arg, int err);
+
+static int
+hello_sock_flush_cb(void *arg)
+{
+	struct hello_context_t *ctx = arg;
+	int rc __attribute__((unused));
+
+	rc = spdk_sock_flush(ctx->sock);
+	assert(rc == 0);
+
+	if (spdk_sock_queued_iovcnt(ctx->sock) == 0) {
+		spdk_interrupt_unregister(&ctx->sockout_intr);
+	}
+
+	return 0;
+}
+
+static int
 hello_sock_writev_poll(void *arg)
 {
 	struct hello_context_t *ctx = arg;
@@ -229,6 +267,32 @@ hello_sock_writev_poll(void *arg)
 		return 0;
 	}
 	if (n > 0) {
+		if (g_is_intr) {
+			if (spdk_sock_queued_iovcnt(ctx->sock) == 0) {
+				ctx->sockout_intr = SPDK_INTERRUPT_REGISTER(ctx->sfdw,
+						    hello_sock_flush_cb, ctx);
+
+				rc = spdk_interrupt_set_event_types(ctx->sockout_intr, SPDK_INTERRUPT_EVENT_OUT);
+				assert(rc == 0);
+			}
+
+			struct hello_async_req *req;
+
+			req = calloc(1, sizeof(*req));
+			assert(req);
+			req->iov->iov_len = n;
+			req->iov->iov_base = malloc(n);
+			assert(req->iov->iov_base);
+			memcpy(req->iov->iov_base, buf_out, n);
+
+			req->sock_req.iovcnt = 1;
+			req->sock_req.cb_fn = hello_sock_write_async_cb;
+			req->sock_req.cb_arg = req;
+			spdk_sock_writev_async(ctx->sock, &req->sock_req);
+
+			return 0;
+		}
+
 		/*
 		 * Send message to the server
 		 */
@@ -272,15 +336,23 @@ hello_sock_connect(struct hello_context_t *ctx)
 	g_is_running = true;
 
 	if (g_is_intr) {
-		int fd;
+		int fd, sfdw;
 
 		fd = spdk_sock_get_fd(ctx->sock);
-		assert(fd > 0);
+		assert(fd >= 0);
+		sfdw = dup(fd);
+		assert(sfdw >= 0);
+		ctx->sfdw = sfdw;
+
 		ctx->stdin_intr = SPDK_INTERRUPT_REGISTER(STDIN_FILENO, hello_sock_writev_poll, ctx);
 		ctx->sockin_intr = SPDK_INTERRUPT_REGISTER(fd, hello_sock_recv_poll, ctx);
-		//ctx->sockout_intr = SPDK_INTERRUPT_REGISTER(STDIN_FILENO, , );
 		assert(ctx->stdin_intr);
 		assert(ctx->sockin_intr);
+
+
+		ctx->poller_in = SPDK_POLLER_REGISTER(hello_sock_exit_poll, ctx,
+						      ACCEPT_TIMEOUT_US);
+		assert(ctx->poller_in);
 	} else {
 		ctx->poller_in = SPDK_POLLER_REGISTER(hello_sock_recv_poll, ctx, 0);
 		ctx->poller_out = SPDK_POLLER_REGISTER(hello_sock_writev_poll, ctx, 0);
@@ -425,7 +497,7 @@ static int
 hello_sock_listen(struct hello_context_t *ctx)
 {
 	struct spdk_sock_group_intr_info intr_infos[NUM_SOCK_GROUP_IMPL];
-	int rc;
+	int rc = 0;
 	int i;
 
 	ctx->sock = spdk_sock_listen(ctx->host, ctx->port, ctx->sock_impl_name);
@@ -480,8 +552,6 @@ static void
 hello_sock_shutdown_cb(void)
 {
 	g_is_running = false;
-	int rc = close(STDIN_FILENO);
-	printf("close rc is %d\n", rc);
 }
 
 /*
