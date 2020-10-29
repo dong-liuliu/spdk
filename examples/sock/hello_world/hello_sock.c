@@ -40,11 +40,13 @@
 
 #include "spdk/sock.h"
 #include "spdk/net.h"
+#include "spdk/assert.h"
 
 #define ACCEPT_TIMEOUT_US 1000
 #define CLOSE_TIMEOUT_US 1000000
 #define BUFFER_SIZE 1024
 #define ADDR_STR_LEN INET6_ADDRSTRLEN
+#define NUM_SOCK_GROUP_IMPL 3
 
 static bool g_is_running;
 
@@ -53,6 +55,16 @@ static char *g_sock_impl_name;
 static int g_port;
 static bool g_is_server;
 static bool g_verbose;
+static bool g_is_intr;
+
+
+struct hello_async_req {
+	struct spdk_sock_request sock_req;
+	struct iovec		 iov[1];
+};
+SPDK_STATIC_ASSERT(offsetof(struct hello_async_req, sock_req) +
+		   sizeof(struct spdk_sock_request) == offsetof(struct hello_async_req, iov),
+		   "Compiler inserted padding between iov and sock_req");
 
 /*
  * We'll use this struct to gather housekeeping hello_context to pass between
@@ -73,6 +85,7 @@ struct hello_context_t {
 	struct spdk_sock_group *group;
 	struct spdk_poller *poller_in;
 	struct spdk_poller *poller_out;
+	struct spdk_interrupt *intr_out[NUM_SOCK_GROUP_IMPL];
 	struct spdk_poller *time_out;
 
 	int rc;
@@ -87,6 +100,7 @@ hello_sock_usage(void)
 	printf(" -H host_addr  host address\n");
 	printf(" -P port       port number\n");
 	printf(" -N sock_impl  socket implementation, e.g., -N posix or -N uring\n");
+	printf(" -E            execution in interrupt mode\n");
 	printf(" -S            start in server mode\n");
 	printf(" -V            print out additional informations");
 }
@@ -112,6 +126,10 @@ static int hello_sock_parse_arg(int ch, char *arg)
 		break;
 	case 'S':
 		g_is_server = 1;
+		break;
+	case 'E':
+		g_is_intr = true;
+		spdk_interrupt_mode_enable();
 		break;
 	case 'V':
 		g_verbose = true;
@@ -142,6 +160,13 @@ hello_sock_quit(struct hello_context_t *ctx, int rc)
 {
 	ctx->rc = rc;
 	spdk_poller_unregister(&ctx->poller_out);
+	if (g_is_intr) {
+		int i;
+		for (i = 0; ctx->intr_out[i]; i++) {
+			spdk_interrupt_unregister(&ctx->intr_out[i]);
+		}
+	}
+
 	if (!ctx->time_out) {
 		ctx->time_out = SPDK_POLLER_REGISTER(hello_sock_close_timeout_poll, ctx,
 						     CLOSE_TIMEOUT_US);
@@ -245,6 +270,19 @@ hello_sock_connect(struct hello_context_t *ctx)
 }
 
 static void
+hello_sock_write_async_cb(void *cb_arg, int err)
+{
+	struct hello_async_req *req = cb_arg;
+
+	if (g_verbose) {
+		printf("** Async write %ld bytes completed with err %d **\n",
+		       req->iov->iov_len, err);
+	}
+	free(req->iov->iov_base);
+	free(req);
+}
+
+static void
 hello_sock_cb(void *arg, struct spdk_sock_group *group, struct spdk_sock *sock)
 {
 	ssize_t n;
@@ -265,6 +303,24 @@ hello_sock_cb(void *arg, struct spdk_sock_group *group, struct spdk_sock *sock)
 	}
 
 	if (n > 0) {
+		if (g_is_intr) {
+			struct hello_async_req *req;
+
+			req = calloc(1, sizeof(*req));
+			assert(req);
+			req->iov->iov_len = n;
+			req->iov->iov_base = malloc(n);
+			assert(req->iov->iov_base);
+			memcpy(req->iov->iov_base, buf, n);
+
+			req->sock_req.iovcnt = 1;
+			req->sock_req.cb_fn = hello_sock_write_async_cb;
+			req->sock_req.cb_arg = req;
+			spdk_sock_writev_async(sock, &req->sock_req);
+
+			return;
+		}
+
 		ctx->bytes_in += n;
 		iov.iov_base = buf;
 		iov.iov_len = n;
@@ -347,6 +403,10 @@ hello_sock_group_poll(void *arg)
 static int
 hello_sock_listen(struct hello_context_t *ctx)
 {
+	struct spdk_sock_group_intr_info intr_infos[NUM_SOCK_GROUP_IMPL];
+	int rc;
+	int i;
+
 	ctx->sock = spdk_sock_listen(ctx->host, ctx->port, ctx->sock_impl_name);
 	if (ctx->sock == NULL) {
 		SPDK_ERRLOG("Cannot create server socket\n");
@@ -360,6 +420,16 @@ hello_sock_listen(struct hello_context_t *ctx)
 	 * Create sock group for server socket
 	 */
 	ctx->group = spdk_sock_group_create(NULL);
+	if (g_is_intr) {
+		rc = spdk_sock_group_set_intr(ctx->group);
+		assert(rc == 0);
+		rc = spdk_sock_group_get_intr_info(ctx->group, intr_infos, NUM_SOCK_GROUP_IMPL);
+		assert(rc > 0 && rc <= NUM_SOCK_GROUP_IMPL);
+		for (i = 0; i < rc; i++) {
+			SPDK_NOTICELOG("sock_impl(%s) has intr_fd(%d)\n",
+				       intr_infos[i].impl_name, intr_infos[i].intr_fd);
+		}
+	}
 
 	g_is_running = true;
 
@@ -368,7 +438,19 @@ hello_sock_listen(struct hello_context_t *ctx)
 	 */
 	ctx->poller_in = SPDK_POLLER_REGISTER(hello_sock_accept_poll, ctx,
 					      ACCEPT_TIMEOUT_US);
-	ctx->poller_out = SPDK_POLLER_REGISTER(hello_sock_group_poll, ctx, 0);
+
+	if (g_is_intr) {
+		for (i = 0; i < rc; i++) {
+			if (intr_infos[i].intr_fd <= 0) {
+				continue;
+			}
+			ctx->intr_out[i] = SPDK_INTERRUPT_REGISTER(intr_infos[i].intr_fd,
+					   (spdk_interrupt_fn)spdk_sock_group_intr_process, intr_infos[i].intr_arg);
+			assert(ctx->intr_out[i]);
+		}
+	} else {
+		ctx->poller_out = SPDK_POLLER_REGISTER(hello_sock_group_poll, ctx, 0);
+	}
 
 	return 0;
 }
@@ -414,7 +496,7 @@ main(int argc, char **argv)
 	opts.name = "hello_sock";
 	opts.shutdown_cb = hello_sock_shutdown_cb;
 
-	if ((rc = spdk_app_parse_args(argc, argv, &opts, "H:N:P:SV", NULL, hello_sock_parse_arg,
+	if ((rc = spdk_app_parse_args(argc, argv, &opts, "H:N:P:SEV", NULL, hello_sock_parse_arg,
 				      hello_sock_usage)) != SPDK_APP_PARSE_ARGS_SUCCESS) {
 		exit(rc);
 	}
