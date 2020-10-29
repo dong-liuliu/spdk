@@ -38,9 +38,11 @@
 #ifndef SPDK_INTERNAL_SOCK_H
 #define SPDK_INTERNAL_SOCK_H
 
+#include "spdk/likely.h"
 #include "spdk/stdinc.h"
 #include "spdk/sock.h"
 #include "spdk/queue.h"
+#include "spdk/log.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -52,7 +54,7 @@ extern "C" {
 #define MIN_SO_RCVBUF_SIZE (2 * 1024 * 1024)
 #define MIN_SO_SNDBUF_SIZE (2 * 1024 * 1024)
 
-struct spdk_sock {
+struct  spdk_sock {
 	struct spdk_net_impl		*net_impl;
 	struct spdk_sock_opts		opts;
 	struct spdk_sock_group_impl	*group_impl;
@@ -74,6 +76,7 @@ struct spdk_sock {
 struct spdk_sock_group {
 	STAILQ_HEAD(, spdk_sock_group_impl)	group_impls;
 	void					*ctx;
+	bool					intr_mode;
 };
 
 struct spdk_sock_group_impl {
@@ -86,6 +89,7 @@ struct spdk_sock_group_impl {
 	 * or added to another poll group later.
 	 */
 	uintptr_t				removed_socks[MAX_EVENTS_PER_POLL];
+	struct spdk_sock_group			*sgroup;
 };
 
 struct spdk_net_impl {
@@ -98,6 +102,7 @@ struct spdk_net_impl {
 	struct spdk_sock *(*listen)(const char *ip, int port, struct spdk_sock_opts *opts);
 	struct spdk_sock *(*accept)(struct spdk_sock *sock);
 	int (*close)(struct spdk_sock *sock);
+	int (*get_fd)(struct spdk_sock *sock);
 	ssize_t (*recv)(struct spdk_sock *sock, void *buf, size_t len);
 	ssize_t (*readv)(struct spdk_sock *sock, struct iovec *iov, int iovcnt);
 	ssize_t (*writev)(struct spdk_sock *sock, struct iovec *iov, int iovcnt);
@@ -120,6 +125,11 @@ struct spdk_net_impl {
 	int (*group_impl_poll)(struct spdk_sock_group_impl *group, int max_events,
 			       struct spdk_sock **socks);
 	int (*group_impl_close)(struct spdk_sock_group_impl *group);
+	int (*group_impl_process_events)(struct spdk_sock_group_impl *group, int max_events,
+					 struct spdk_sock **socks);
+	int (*group_impl_get_fd)(struct spdk_sock_group_impl *group);
+	int (*group_impl_sock_data_out)(struct spdk_sock_group_impl *group, struct spdk_sock *sock,
+					bool out);
 
 	int (*get_opts)(struct spdk_sock_impl_opts *opts, size_t *len);
 	int (*set_opts)(const struct spdk_sock_impl_opts *opts, size_t len);
@@ -138,6 +148,17 @@ static void __attribute__((constructor)) net_impl_register_##name(void) \
 static inline void
 spdk_sock_request_queue(struct spdk_sock *sock, struct spdk_sock_request *req)
 {
+	if (spdk_unlikely(sock->group_impl && sock->group_impl->sgroup &&
+			  sock->group_impl->sgroup->intr_mode) &&
+	    TAILQ_EMPTY(&sock->queued_reqs)) {
+		// add epollout;
+		int rc;
+
+		rc = sock->net_impl->group_impl_sock_data_out(sock->group_impl, sock, true);
+		if (rc) {
+			SPDK_ERRLOG("failed to set sock data out.\n");
+		}
+	}
 	TAILQ_INSERT_TAIL(&sock->queued_reqs, req, internal.link);
 	sock->queued_iovcnt += req->iovcnt;
 }
@@ -147,6 +168,19 @@ spdk_sock_request_pend(struct spdk_sock *sock, struct spdk_sock_request *req)
 {
 	TAILQ_REMOVE(&sock->queued_reqs, req, internal.link);
 	assert(sock->queued_iovcnt >= req->iovcnt);
+
+	if (spdk_unlikely(sock->group_impl && sock->group_impl->sgroup &&
+			  sock->group_impl->sgroup->intr_mode) &&
+	    TAILQ_EMPTY(&sock->queued_reqs)) {
+		// remove epollout;
+		int rc;
+
+		rc = sock->net_impl->group_impl_sock_data_out(sock->group_impl, sock, false);
+		if (rc) {
+			SPDK_ERRLOG("failed to set sock data out.\n");
+		}
+	}
+
 	sock->queued_iovcnt -= req->iovcnt;
 	TAILQ_INSERT_TAIL(&sock->pending_reqs, req, internal.link);
 }
@@ -193,6 +227,22 @@ spdk_sock_abort_requests(struct spdk_sock *sock)
 		req->cb_fn(req->cb_arg, -ECANCELED);
 
 		req = TAILQ_FIRST(&sock->pending_reqs);
+	}
+
+	if (spdk_unlikely(sock->group_impl && sock->group_impl->sgroup &&
+			  sock->group_impl->sgroup->intr_mode) &&
+	    !TAILQ_EMPTY(&sock->queued_reqs)) {
+		// remove epollout;
+		int rc;
+
+		if (sock->net_impl->group_impl_sock_data_out != NULL) {
+			rc = sock->net_impl->group_impl_sock_data_out(sock->group_impl, sock, false);
+			if (rc) {
+				SPDK_ERRLOG("failed to set sock data out.\n");
+			}
+		} else {
+			SPDK_ERRLOG("Interrupt mode is not supported.\n");
+		}
 	}
 
 	req = TAILQ_FIRST(&sock->queued_reqs);

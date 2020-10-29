@@ -374,6 +374,23 @@ spdk_sock_close(struct spdk_sock **_sock)
 	return rc;
 }
 
+
+int
+spdk_sock_get_fd(struct spdk_sock *sock)
+{
+	if (sock->net_impl->get_fd == NULL) {
+		return -1;
+	}
+
+	return sock->net_impl->get_fd(sock);
+}
+
+int
+spdk_sock_queued_iovcnt(struct spdk_sock *sock)
+{
+	return sock->queued_iovcnt;
+}
+
 ssize_t
 spdk_sock_recv(struct spdk_sock *sock, void *buf, size_t len)
 {
@@ -511,6 +528,7 @@ spdk_sock_group_create(void *ctx)
 			TAILQ_INIT(&group_impl->socks);
 			group_impl->num_removed_socks = 0;
 			group_impl->net_impl = impl;
+			group_impl->sgroup = group;
 		}
 	}
 
@@ -547,6 +565,17 @@ spdk_sock_group_add_sock(struct spdk_sock_group *group, struct spdk_sock *sock,
 		 */
 		errno = EBUSY;
 		return -1;
+	}
+
+	if (group->intr_mode) {
+		struct spdk_net_impl *net_impl = sock->net_impl;
+
+		if (net_impl->group_impl_process_events == NULL ||
+		    net_impl->group_impl_get_fd == NULL) {
+			SPDK_ERRLOG("Non-interruptable impl %s implemented sock\n", net_impl->name);
+			errno = EINVAL;
+			return -1;
+		}
 	}
 
 	placement_id = sock_get_placement_id(sock);
@@ -626,7 +655,7 @@ spdk_sock_group_poll(struct spdk_sock_group *group)
 static int
 sock_group_impl_poll_count(struct spdk_sock_group_impl *group_impl,
 			   struct spdk_sock_group *group,
-			   int max_events)
+			   int max_events, bool intr_mode)
 {
 	struct spdk_sock *socks[MAX_EVENTS_PER_POLL];
 	int num_events, i;
@@ -638,7 +667,12 @@ sock_group_impl_poll_count(struct spdk_sock_group_impl *group_impl,
 	/* The number of removed sockets should be reset for each call to poll. */
 	group_impl->num_removed_socks = 0;
 
-	num_events = group_impl->net_impl->group_impl_poll(group_impl, max_events, socks);
+	if (intr_mode) {
+		num_events = group_impl->net_impl->group_impl_process_events(group_impl, max_events, socks);
+	} else {
+		num_events = group_impl->net_impl->group_impl_poll(group_impl, max_events, socks);
+	}
+
 	if (num_events == -1) {
 		return -1;
 	}
@@ -664,6 +698,84 @@ sock_group_impl_poll_count(struct spdk_sock_group_impl *group_impl,
 }
 
 int
+spdk_sock_group_intr_process(void *intr_arg)
+{
+	struct spdk_sock_group_impl *group_impl = intr_arg;
+	int rc;
+
+	rc = sock_group_impl_poll_count(group_impl, group_impl->sgroup, MAX_EVENTS_PER_POLL, true);
+	if (rc < 0) {
+		SPDK_ERRLOG("group_impl_poll_count in intr for net(%s) failed\n",
+			    group_impl->net_impl->name);
+	}
+
+	return rc;
+}
+
+int
+spdk_sock_group_get_intr_info(struct spdk_sock_group *sock_group,
+			      struct spdk_sock_group_intr_info *intr_infos,
+			      int info_count)
+{
+	struct spdk_sock_group_impl *group_impl = NULL;
+	struct spdk_net_impl *net_impl;
+	struct spdk_sock_group_intr_info *intr_info;
+	int idx = 0;
+
+	if (sock_group == NULL || intr_infos == NULL || info_count <= 0) {
+		return -EINVAL;
+	}
+
+	STAILQ_FOREACH_FROM(group_impl, &sock_group->group_impls, link) {
+		if (idx >= info_count) {
+			break;
+		}
+
+		intr_info = &intr_infos[idx++];
+		intr_info->impl_name = group_impl->net_impl->name;
+
+		/* sock impl should implement method group_impl_process_events to support interrupt mode */
+		net_impl = group_impl->net_impl;
+		if (net_impl->group_impl_process_events == NULL ||
+		    net_impl->group_impl_get_fd == NULL ||
+		    net_impl->group_impl_get_fd(group_impl) <= 0) {
+			intr_info->intr_fd = -1;
+			intr_info->intr_arg = NULL;
+			continue;
+		}
+
+		intr_info->intr_fd = net_impl->group_impl_get_fd(group_impl);
+		intr_info->intr_arg = group_impl;
+	}
+
+	return idx;
+}
+
+int
+spdk_sock_group_set_intr(struct spdk_sock_group *sock_group)
+{
+	struct spdk_sock_group_impl *group_impl = NULL;
+	struct spdk_net_impl *net_impl;
+
+	STAILQ_FOREACH_FROM(group_impl, &sock_group->group_impls, link) {
+		net_impl = group_impl->net_impl;
+		if (net_impl->group_impl_process_events == NULL ||
+		    net_impl->group_impl_get_fd == NULL ||
+		    net_impl->group_impl_get_fd(group_impl) <= 0 ||
+		    /* If group_impl doesn't support intr mode, any existing socks
+		     * will block intr setting.
+		     */
+		    !TAILQ_EMPTY(&group_impl->socks)) {
+			SPDK_ERRLOG("Non-interruptable impl %s has existing socks\n", net_impl->name);
+			return -EINVAL;
+		}
+	}
+
+	sock_group->intr_mode = true;
+	return 0;
+}
+
+int
 spdk_sock_group_poll_count(struct spdk_sock_group *group, int max_events)
 {
 	struct spdk_sock_group_impl *group_impl = NULL;
@@ -683,7 +795,7 @@ spdk_sock_group_poll_count(struct spdk_sock_group *group, int max_events)
 	}
 
 	STAILQ_FOREACH_FROM(group_impl, &group->group_impls, link) {
-		rc = sock_group_impl_poll_count(group_impl, group, max_events);
+		rc = sock_group_impl_poll_count(group_impl, group, max_events, false);
 		if (rc < 0) {
 			num_events = -1;
 			SPDK_ERRLOG("group_impl_poll_count for net(%s) failed\n",

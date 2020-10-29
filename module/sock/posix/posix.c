@@ -655,6 +655,14 @@ posix_sock_close(struct spdk_sock *_sock)
 	return 0;
 }
 
+static int
+posix_sock_get_fd(struct spdk_sock *_sock)
+{
+	struct spdk_posix_sock *sock = __posix_sock(_sock);
+
+	return sock->fd;
+}
+
 #ifdef SPDK_ZEROCOPY
 static int
 _sock_check_zcopy(struct spdk_sock *sock)
@@ -1183,6 +1191,33 @@ posix_sock_group_impl_add_sock(struct spdk_sock_group_impl *_group, struct spdk_
 }
 
 static int
+posix_sock_group_impl_sock_data_out(struct spdk_sock_group_impl *_group, struct spdk_sock *_sock,
+				    bool out)
+{
+	struct spdk_posix_sock_group_impl *group = __posix_group_impl(_group);
+	struct spdk_posix_sock *sock = __posix_sock(_sock);
+	int rc;
+
+#if defined(__linux__)
+	struct epoll_event event;
+
+	memset(&event, 0, sizeof(event));
+	/* EPOLLERR is always on even if we don't set it, but be explicit for clarity */
+	event.events = EPOLLIN | EPOLLERR;
+	if (out) {
+		event.events |= EPOLLOUT;
+	}
+	event.data.ptr = sock;
+
+	rc = epoll_ctl(group->fd, EPOLL_CTL_MOD, sock->fd, &event);
+#elif defined(__FreeBSD__)
+	rc = -1;
+	errno = -ENOTSUP;
+#endif
+	return rc;
+}
+
+static int
 posix_sock_group_impl_remove_sock(struct spdk_sock_group_impl *_group, struct spdk_sock *_sock)
 {
 	struct spdk_posix_sock_group_impl *group = __posix_group_impl(_group);
@@ -1220,13 +1255,24 @@ posix_sock_group_impl_remove_sock(struct spdk_sock_group_impl *_group, struct sp
 	return rc;
 }
 
+static inline void
+_posix_sock_process_flush(struct spdk_sock *sock)
+{
+	int rc;
+
+	rc = _sock_flush(sock);
+	if (rc) {
+		spdk_sock_abort_requests(sock);
+	}
+}
+
 static int
-posix_sock_group_impl_poll(struct spdk_sock_group_impl *_group, int max_events,
-			   struct spdk_sock **socks)
+posix_sock_group_impl_process_events(struct spdk_sock_group_impl *_group, int max_events,
+				     struct spdk_sock **socks)
 {
 	struct spdk_posix_sock_group_impl *group = __posix_group_impl(_group);
-	struct spdk_sock *sock, *tmp;
-	int num_events, i, rc;
+	struct spdk_sock *sock;
+	int num_events, i;
 	struct spdk_posix_sock *psock, *ptmp;
 #if defined(__linux__)
 	struct epoll_event events[MAX_EVENTS_PER_POLL];
@@ -1234,16 +1280,6 @@ posix_sock_group_impl_poll(struct spdk_sock_group_impl *_group, int max_events,
 	struct kevent events[MAX_EVENTS_PER_POLL];
 	struct timespec ts = {0};
 #endif
-
-	/* This must be a TAILQ_FOREACH_SAFE because while flushing,
-	 * a completion callback could remove the sock from the
-	 * group. */
-	TAILQ_FOREACH_SAFE(sock, &_group->socks, link, tmp) {
-		rc = _sock_flush(sock);
-		if (rc) {
-			spdk_sock_abort_requests(sock);
-		}
-	}
 
 #if defined(__linux__)
 	num_events = epoll_wait(group->fd, events, max_events, 0);
@@ -1282,6 +1318,12 @@ posix_sock_group_impl_poll(struct spdk_sock_group_impl *_group, int max_events,
 			}
 		}
 #endif
+		/* EPOLLOUT is only valid for interrupt mode to send out data */
+		if ((events[i].events & EPOLLOUT) != 0) {
+			_posix_sock_process_flush(sock);
+			continue;
+		}
+
 		if ((events[i].events & EPOLLIN) == 0) {
 			continue;
 		}
@@ -1327,6 +1369,22 @@ posix_sock_group_impl_poll(struct spdk_sock_group_impl *_group, int max_events,
 }
 
 static int
+posix_sock_group_impl_poll(struct spdk_sock_group_impl *_group, int max_events,
+			   struct spdk_sock **socks)
+{
+	struct spdk_sock *sock, *tmp;
+
+	/* This must be a TAILQ_FOREACH_SAFE because while flushing,
+	 * a completion callback could remove the sock from the
+	 * group. */
+	TAILQ_FOREACH_SAFE(sock, &_group->socks, link, tmp) {
+		_posix_sock_process_flush(sock);
+	}
+
+	return posix_sock_group_impl_process_events(_group, max_events, socks);
+}
+
+static int
 posix_sock_group_impl_close(struct spdk_sock_group_impl *_group)
 {
 	struct spdk_posix_sock_group_impl *group = __posix_group_impl(_group);
@@ -1335,6 +1393,14 @@ posix_sock_group_impl_close(struct spdk_sock_group_impl *_group)
 	rc = close(group->fd);
 	free(group);
 	return rc;
+}
+
+static int
+posix_sock_group_impl_get_fd(struct spdk_sock_group_impl *_group)
+{
+	struct spdk_posix_sock_group_impl *group = __posix_group_impl(_group);
+
+	return group->fd;
 }
 
 static int
@@ -1405,6 +1471,7 @@ static struct spdk_net_impl g_posix_net_impl = {
 	.listen		= posix_sock_listen,
 	.accept		= posix_sock_accept,
 	.close		= posix_sock_close,
+	.get_fd		= posix_sock_get_fd,
 	.recv		= posix_sock_recv,
 	.readv		= posix_sock_readv,
 	.writev		= posix_sock_writev,
@@ -1422,6 +1489,10 @@ static struct spdk_net_impl g_posix_net_impl = {
 	.group_impl_remove_sock = posix_sock_group_impl_remove_sock,
 	.group_impl_poll	= posix_sock_group_impl_poll,
 	.group_impl_close	= posix_sock_group_impl_close,
+	.group_impl_process_events = posix_sock_group_impl_process_events,
+	.group_impl_get_fd = posix_sock_group_impl_get_fd,
+	.group_impl_sock_data_out = posix_sock_group_impl_sock_data_out,
+
 	.get_opts	= posix_sock_impl_get_opts,
 	.set_opts	= posix_sock_impl_set_opts,
 };

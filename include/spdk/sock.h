@@ -259,6 +259,11 @@ struct spdk_sock *spdk_sock_accept(struct spdk_sock *sock);
  */
 int spdk_sock_close(struct spdk_sock **sock);
 
+
+int spdk_sock_get_fd(struct spdk_sock *sock);
+
+int spdk_sock_queued_iovcnt(struct spdk_sock *sock);
+
 /**
  * Flush a socket from data gathered in previous writev_async calls.
  *
@@ -392,6 +397,19 @@ struct spdk_sock_group *spdk_sock_group_create(void *ctx);
  */
 void *spdk_sock_group_get_ctx(struct spdk_sock_group *sock_group);
 
+int spdk_sock_group_intr_process(void *intr_arg);
+
+struct spdk_sock_group_intr_info {
+	const char	*impl_name;
+	int		intr_fd;
+	void		*intr_arg;
+};
+
+int spdk_sock_group_get_intr_info(struct spdk_sock_group *sock_group,
+				  struct spdk_sock_group_intr_info *intr_infos,
+				  int info_count);
+
+int spdk_sock_group_set_intr(struct spdk_sock_group *sock_group);
 
 /**
  * Add a socket to the group.
