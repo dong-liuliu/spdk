@@ -1,6 +1,207 @@
+
+# Containerizing SPDK Demo
+
+This version of SPDK is used as a demo for containerizing SPDK application.
+This demo is verification that with interrupt mode, SPDK application can be launched
+as much more container instances.
+
+In this demo, SPDK hello_sock server is launched by docker with Kata runtime as tens of
+container instances. Then launch a hello_sock client by docker to connect any one of
+the hello_sock servers.
+Users may check if running hello_sock in polling mode, then
+CPU% is very high like **100% X Number of container instances**.
+But when hello_sock is in interrupt mode, the CPU% will be decreased a lot.
+
+
+Here we would like to use exmaple/sock/hello_sock as the demo application.
+hello_sock has no requirement on any storage resource. It is a simple server/client
+demo app, and can work as a server as well as client. When hello_sock works as
+a server, it will accept connection, receive message from client and echo the message
+back to client. When hello_sock works as a client, it will simply connect a server,
+user may send some text in STDIN, and then get the same response text from server
+to client's STDOUT.
+
+
+**Note:**
+> **In this version of SPDK hello_sock, it can work both in polling mode (by default)
+or in interrupt mode (by set "-E").
+Hugepage dependency is removed as experiment, and one extra memsize setting is required
+like ("-s  512").**
+
+## Demo env
+
+We recommend user to use docker with Kata Containers runtime， since Kata containers has
+a abstract layer to hide host server CPU index.
+
+## Preparation
+
+1. Prepare a docker image with SPDK required dependent libraries by Dockerfile, like
+
+~~~{.text}
+# start with the latest Fedora
+FROM fedora
+
+# if you are behind a proxy, set that up now
+ADD dnf.conf /etc/dnf/dnf.conf
+
+# these are the min dependencies for the SPDK app
+RUN dnf install libaio-devel -y
+RUN dnf install numactl-devel -y
+
+# set our working dir
+WORKDIR /
+~~~
+
+2. Then Create your spdk runnable image
+
+~~~{.sh}
+sudo docker image build -t spdk_demo:0.1 .
+~~~
+
+3. Download this demo version of SPDK to dir like /test/spdk
+
+4. Configure and compile demo version of SPDK
+
+~~~{.sh}
+sudo ./configure
+sudo make -j18
+~~~
+
+>**Note:** SPDK hello_sock app will be passed to container by shared volume
+
+## Containerizing Demo
+
+### Polling mode demo
+
+~~~{.sh}
+for i in {1..10}; do
+  docker run --rm -d --runtime=kata-runtime -v "/test/spdk:/spdk" spdk_demo:0.1 \
+  /bin/bash -c "serverip=\`awk 'END{print \$1}' /etc/hosts\` && \
+  /spdk/build/examples/hello_sock -H \$serverip -P 12345 -V  -s 512 -S"
+done
+
+# Check your hello_sock server containers
+docker ps
+~~~
+
+~~~{.sh}
+serverip=172.18.0.10
+docker run --rm -ti --runtime=kata-runtime -v "/test/spdk:/spdk" spdk_demo:0.1 \
+/bin/bash -c "/spdk/build/examples/hello_sock -H $serverip -P 12345 -s 512"
+~~~
+
+The output of the hello_sock client should be:
+~~~{.text}
+[2020-10-30 15:32:25.840628] Starting SPDK v21.01-pre git sha1 a28f7097e / DPDK 20.08.0 initialization...
+[2020-10-30 15:32:25.843098] [ DPDK EAL parameters: [2020-10-30 15:32:25.844728] hello_sock [2020-10-30 15:32:25.846321] --no-shconf [2020-10-30 15:32:25.847884] -c 0x1 [2020-10-30 15:32:25.849463] -m 512 [2020-10-30 15:32:25.851063] --no-huge [2020-10-30 15:32:25.852574] --log-level=lib.eal:6 [2020-10-30 15:32:25.854089] --log-level=lib.cryptodev:5 [2020-10-30 15:32:25.855663] --log-level=user1:6 [2020-10-30 15:32:25.857242] --base-virtaddr=0x200000000000 [2020-10-30 15:32:25.858793] --file-prefix=spdk_pid1 [2020-10-30 15:32:25.860356] ]
+EAL:   cannot open VFIO container, error 2 (No such file or directory)
+EAL: VFIO support could not be initialized
+EAL: No legacy callbacks, legacy socket not created
+[2020-10-30 15:32:26.007758] app.c: 464:spdk_app_start: *NOTICE*: Total cores available: 1
+[2020-10-30 15:32:26.141058] reactor.c: 693:reactor_run: *NOTICE*: Reactor started on core 0
+[2020-10-30 15:32:26.148421] hello_sock.c: 566:hello_start: *NOTICE*: Successfully started the application
+[2020-10-30 15:32:26.151132] hello_sock.c: 317:hello_sock_connect: *NOTICE*: Connecting to the server on 172.18.0.10:12345 with sock_impl((null))
+[2020-10-30 15:32:26.158067] hello_sock.c: 332:hello_sock_connect: *NOTICE*: Connection accepted from (172.18.0.10, 12345) to (172.18.0.12, 45396)
+~~~
+
+User may input some text with `enter`, then get server's feed back
+~~~{.text}
+This is a Containerize SPDK demo
+This is a Containerize SPDK demo
+It's in polling mode
+It's in polling mode
+~~~
+
+Check CPU% by top:
+~~~
+   PID USER      PR  NI    VIRT    RES    SHR S  %CPU %MEM     TIME+ COMMAND
+ 13841 root      20   0 3250352 313100 293156 S 100.0  0.3   1:05.14 qemu-system-x86
+ 13971 root      20   0 3250352 313280 293204 S 100.0  0.3   1:03.60 qemu-system-x86
+ 14235 root      20   0 3250352 312992 293056 S 100.0  0.3   1:00.54 qemu-system-x86
+ 14368 root      20   0 3250352 312956 292804 S 100.0  0.3   0:59.04 qemu-system-x86
+ 14501 root      20   0 3250352 312940 292908 S 100.0  0.3   0:57.34 qemu-system-x86
+ 14634 root      20   0 3250352 312936 292736 S 100.0  0.3   0:55.89 qemu-system-x86
+ 14773 root      20   0 3250352 313008 292996 S 100.0  0.3   0:54.44 qemu-system-x86
+ 14904 root      20   0 3250352 312940 292996 S 100.0  0.3   0:53.08 qemu-system-x86
+ 15064 root      20   0 3250352 313452 293424 S 100.0  0.3   0:40.44 qemu-system-x86
+ 11767 root      20   0 3250352 313104 293116 S  99.7  0.3   2:38.68 qemu-system-x86
+ 14101 root      20   0 3250352 313172 293212 S  99.7  0.3   1:02.07 qemu-system-x86
+~~~
+
+Close these SPDK hello_sock instances
+~~~
+sudo docker container rm -f `docker ps -q`
+~~~
+
+### Interrupt mode demo
+
+~~~{.sh}
+for i in {1..10}; do
+  docker run --rm -d --runtime=kata-runtime -v "/test/spdk:/spdk" spdk_demo:0.1 \
+  /bin/bash -c "serverip=\`awk 'END{print \$1}' /etc/hosts\` && \
+  /spdk/build/examples/hello_sock -H \$serverip -P 12345 -V  -s 512 -E -S"
+done
+
+# Check your hello_sock server containers
+docker ps
+~~~
+
+~~~{.sh}
+serverip=172.18.0.10
+docker run --rm -ti --runtime=kata-runtime -v "/test/spdk:/spdk" spdk_demo:0.1 \
+/bin/bash -c "/spdk/build/examples/hello_sock -H $serverip -P 12345 -s 512 -E"
+~~~
+
+The output of the hello_sock client should be:
+~~~{.text}
+[2020-10-30 15:21:48.863964] thread.c:2004:spdk_interrupt_mode_enable: *NOTICE*: Set SPDK running in interrupt mode.
+[2020-10-30 15:21:48.867873] Starting SPDK v21.01-pre git sha1 a28f7097e / DPDK 20.08.0 initialization...
+[2020-10-30 15:21:48.869359] [ DPDK EAL parameters: [2020-10-30 15:21:48.871758] hello_sock [2020-10-30 15:21:48.874736] --no-shconf [2020-10-30 15:21:48.877562] -c 0x1 [2020-10-30 15:21:48.880430] -m 512 [2020-10-30 15:21:48.883206] --no-huge [2020-10-30 15:21:48.885584] --log-level=lib.eal:6 [2020-10-30 15:21:48.887980] --log-level=lib.cryptodev:5 [2020-10-30 15:21:48.890343] --log-level=user1:6 [2020-10-30 15:21:48.892737] --base-virtaddr=0x200000000000 [2020-10-30 15:21:48.894830] --file-prefix=spdk_pid1 [2020-10-30 15:21:48.896679] ]
+EAL:   cannot open VFIO container, error 2 (No such file or directory)
+EAL: VFIO support could not be initialized
+EAL: No legacy callbacks, legacy socket not created
+[2020-10-30 15:21:49.048467] app.c: 464:spdk_app_start: *NOTICE*: Total cores available: 1
+[2020-10-30 15:21:49.178801] reactor.c: 693:reactor_run: *NOTICE*: Reactor started on core 0
+[2020-10-30 15:21:49.185671] hello_sock.c: 566:hello_start: *NOTICE*: Successfully started the application
+[2020-10-30 15:21:49.188538] hello_sock.c: 317:hello_sock_connect: *NOTICE*: Connecting to the server on 172.18.0.10:12345 with sock_impl((null))
+[2020-10-30 15:21:49.195135] hello_sock.c: 332:hello_sock_connect: *NOTICE*: Connection accepted from (172.18.0.10, 12345) to (172.18.0.12, 57024)
+~~~
+
+User may input some text with `enter`, then get server's feed back
+~~~{.text}
+This is a Containerize SPDK demo
+This is a Containerize SPDK demo
+It's in interrupt mode
+It's in interrupt mode
+~~~
+
+Check CPU% by top:
+~~~
+ PID USER      PR  NI    VIRT    RES    SHR S  %CPU %MEM     TIME+ COMMAND
+  9937 root      20   0 3250352 312964 293000 S  17.8  0.3   0:38.84 qemu-system-x86
+  9807 root      20   0 3250352 313280 293352 S  13.9  0.3   0:30.76 qemu-system-x86
+ 10369 root      20   0 3250352 313952 293896 S  10.2  0.3   0:13.19 qemu-system-x86
+  9422 root      20   0 3250352 313312 293364 S   8.9  0.3   0:23.85 qemu-system-x86
+  8765 root      20   0 3250352 313180 293180 S   8.6  0.3   0:23.75 qemu-system-x86
+  9163 root      20   0 3250352 313224 293224 S   8.6  0.3   0:23.60 qemu-system-x86
+  9554 root      20   0 3250352 313376 293288 S   8.6  0.3   0:22.81 qemu-system-x86
+  9029 root      20   0 3250352 313428 293448 S   8.3  0.3   0:23.62 qemu-system-x86
+  9291 root      20   0 3250352 312988 292968 S   8.3  0.3   0:23.48 qemu-system-x86
+  8899 root      20   0 3250352 313260 293280 S   7.9  0.3   0:23.96 qemu-system-x86
+  9679 root      20   0 3250352 313236 293228 S   7.9  0.3   0:21.32 qemu-system-x86
+~~~
+
+Close these SPDK hello_sock instances
+~~~
+sudo docker container rm -f `docker ps -q`
+~~~
+
+> **Note:** From the CPU%, we can find that, polling mode will consume too much CPU cores, so the container instances will be limited seriously. While interrupt mode will only consume a few CPU resources, so running spdk application in interrupt mode is more friendly to contaierize SPDK related applications.
+
 # Storage Performance Development Kit
 
 [![Build Status](https://travis-ci.org/spdk/spdk.svg?branch=master)](https://travis-ci.org/spdk/spdk)
+
 
 The Storage Performance Development Kit ([SPDK](http://www.spdk.io)) provides a set of tools
 and libraries for writing high performance, scalable, user-mode storage
