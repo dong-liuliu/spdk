@@ -133,6 +133,8 @@ static const struct option g_cmdline_options[] = {
 	{"iova-mode",			required_argument,	NULL, IOVA_MODE_OPT_IDX},
 #define BASE_VIRTADDR_OPT_IDX	265
 	{"base-virtaddr",		required_argument,	NULL, BASE_VIRTADDR_OPT_IDX},
+#define ENABLE_TRACE		266
+	{"enable_trace",		no_argument,		NULL, ENABLE_TRACE},
 };
 
 static void
@@ -476,15 +478,17 @@ spdk_app_start(struct spdk_app_opts *opts, spdk_msg_fn start_fn,
 		return 1;
 	}
 
-	/*
-	 * Note the call to app_setup_trace() is located here
-	 * ahead of app_setup_signal_handlers().
-	 * That's because there is not an easy/direct clean
-	 * way of unwinding alloc'd resources that can occur
-	 * in app_setup_signal_handlers().
-	 */
-	if (app_setup_trace(opts) != 0) {
-		return 1;
+	if (opts->trace_enabled) {
+		/*
+		 * Note the call to app_setup_trace() is located here
+		 * ahead of app_setup_signal_handlers().
+		 * That's because there is not an easy/direct clean
+		 * way of unwinding alloc'd resources that can occur
+		 * in app_setup_signal_handlers().
+		 */
+		if (app_setup_trace(opts) != 0) {
+			return 1;
+		}
 	}
 
 	if (app_setup_signal_handlers(opts) != 0) {
@@ -579,8 +583,9 @@ usage(void (*app_usage)(void))
 	printf("      --base-virtaddr <addr>      the base virtual address for DPDK (default: 0x200000000000)\n");
 	printf("      --num-trace-entries <num>   number of trace entries for each core, must be power of 2. (default %d)\n",
 	       SPDK_APP_DEFAULT_NUM_TRACE_ENTRIES);
-	spdk_log_usage(stdout, "-L");
+	printf("      --enable_trace	   enable spdk trace.\n");
 	spdk_trace_mask_usage(stdout, "-e");
+	spdk_log_usage(stdout, "-L");
 	if (app_usage) {
 		app_usage();
 	}
@@ -794,6 +799,9 @@ spdk_app_parse_args(int argc, char **argv, struct spdk_app_opts *opts,
 			break;
 		case IOVA_MODE_OPT_IDX:
 			opts->iova_mode = optarg;
+			break;
+		case ENABLE_TRACE:
+			opts->trace_enabled = true;
 			break;
 		case NUM_TRACE_ENTRIES_OPT_IDX:
 			tmp = spdk_strtoll(optarg, 0);

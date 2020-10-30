@@ -50,6 +50,10 @@ spdk_trace_get_tpoint_mask(uint32_t group_id)
 		return 0ULL;
 	}
 
+	if (g_trace_flags == NULL) {
+		return 0ULL;
+	}
+
 	return g_trace_flags->tpoint_mask[group_id];
 }
 
@@ -61,6 +65,10 @@ spdk_trace_set_tpoints(uint32_t group_id, uint64_t tpoint_mask)
 		return;
 	}
 
+	if (g_trace_flags == NULL) {
+		return;
+	}
+
 	g_trace_flags->tpoint_mask[group_id] |= tpoint_mask;
 }
 
@@ -69,6 +77,10 @@ spdk_trace_clear_tpoints(uint32_t group_id, uint64_t tpoint_mask)
 {
 	if (group_id >= SPDK_TRACE_MAX_GROUP_ID) {
 		SPDK_ERRLOG("invalid group ID %d\n", group_id);
+		return;
+	}
+
+	if (g_trace_flags == NULL) {
 		return;
 	}
 
@@ -207,6 +219,7 @@ spdk_trace_register_owner(uint8_t type, char id_prefix)
 	struct spdk_trace_owner *owner;
 
 	assert(type != OWNER_NONE);
+	assert(g_trace_flags);
 
 	/* 'owner' has 256 entries and since 'type' is a uint8_t, it
 	 * can't overrun the array.
@@ -224,6 +237,7 @@ spdk_trace_register_object(uint8_t type, char id_prefix)
 	struct spdk_trace_object *object;
 
 	assert(type != OBJECT_NONE);
+	assert(g_trace_flags);
 
 	/* 'object' has 256 entries and since 'type' is a uint8_t, it
 	 * can't overrun the array.
@@ -244,6 +258,7 @@ spdk_trace_register_description(const char *name, uint16_t tpoint_id, uint8_t ow
 
 	assert(tpoint_id != 0);
 	assert(tpoint_id < SPDK_TRACE_MAX_TPOINT_ID);
+	assert(g_trace_flags);
 
 	if (strnlen(name, sizeof(tpoint->name)) == sizeof(tpoint->name)) {
 		SPDK_ERRLOG("name (%s) too long\n", name);
